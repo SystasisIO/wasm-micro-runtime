@@ -2811,18 +2811,14 @@ load_function_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
 #endif
     }
 
-    /* Set start function when function pointers are resolved */
-    if (module->start_func_index != (uint32)-1) {
-        if (module->start_func_index >= module->import_func_count)
-            module->start_function =
-                module->func_ptrs[module->start_func_index
-                                  - module->import_func_count];
-        else
-            /* TODO: fix start function can be import function issue */
-            module->start_function = NULL;
-    }
-    else {
-        module->start_function = NULL;
+    /* Only defined functions have a generated-code pointer. Imported start
+       functions are dispatched by start_func_index through their native ABI. */
+    module->start_function = NULL;
+    if (module->start_func_index != (uint32)-1
+        && module->start_func_index >= module->import_func_count) {
+        module->start_function =
+            module->func_ptrs[module->start_func_index
+                              - module->import_func_count];
     }
 
     size = sizeof(uint32) * (uint64)module->func_count;

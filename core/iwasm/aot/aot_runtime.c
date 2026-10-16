@@ -1706,7 +1706,8 @@ lookup_post_instantiate_func(AOTModuleInstance *module_inst,
         /* Not found */
         return NULL;
 
-    func_type = func->u.func.func_type;
+    func_type = func->is_import_func ? func->u.func_import->func_type
+                                    : func->u.func.func_type;
     if (!(func_type->param_count == 0 && func_type->result_count == 0))
         /* Not a valid function type, ignore it */
         return NULL;
@@ -1761,8 +1762,8 @@ execute_post_instantiate_functions(AOTModuleInstance *module_inst,
     }
 #endif
 
-    if (!module->start_function && !initialize_func && !post_inst_func
-        && !call_ctors_func) {
+    if (module->start_func_index == (uint32)-1 && !initialize_func
+        && !post_inst_func && !call_ctors_func) {
         /* No post instantiation functions to call */
         return true;
     }
@@ -1827,18 +1828,24 @@ execute_post_instantiate_functions(AOTModuleInstance *module_inst,
 #endif
 
     /* Execute start function for both main instance and sub instance */
-    if (module->start_function) {
+    if (module->start_func_index != (uint32)-1) {
         AOTFunctionInstance start_func = { 0 };
-        uint32 func_type_idx;
 
         start_func.func_name = "";
         start_func.func_index = module->start_func_index;
-        start_func.is_import_func = false;
-        func_type_idx = module->func_type_indexes[module->start_func_index
-                                                  - module->import_func_count];
-        start_func.u.func.func_type =
-            (AOTFuncType *)module->types[func_type_idx];
-        start_func.u.func.func_ptr = module->start_function;
+        if (module->start_func_index < module->import_func_count) {
+            start_func.is_import_func = true;
+            start_func.u.func_import =
+                &module->import_funcs[module->start_func_index];
+        }
+        else {
+            uint32 func_type_idx =
+                module->func_type_indexes[module->start_func_index
+                                          - module->import_func_count];
+            start_func.u.func.func_type =
+                (AOTFuncType *)module->types[func_type_idx];
+            start_func.u.func.func_ptr = module->start_function;
+        }
         if (!aot_call_function(exec_env, &start_func, 0, NULL)) {
             goto fail;
         }

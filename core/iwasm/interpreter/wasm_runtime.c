@@ -1626,7 +1626,8 @@ lookup_post_instantiate_func(WASMModuleInstance *module_inst,
         /* Not found */
         return NULL;
 
-    func_type = func->u.func->func_type;
+    func_type = func->is_import_func ? func->u.func_import->func_type
+                                    : func->u.func->func_type;
     if (!(func_type->param_count == 0 && func_type->result_count == 0))
         /* Not a valid function type, ignore it */
         return NULL;
@@ -3345,10 +3346,8 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     }
 
     if (module->start_function != (uint32)-1) {
-        /* TODO: fix start function can be import function issue */
-        if (module->start_function >= module->import_function_count)
-            module_inst->e->start_function =
-                &module_inst->e->functions[module->start_function];
+        module_inst->e->start_function =
+            &module_inst->e->functions[module->start_function];
     }
 
     if (args->defer_start && !is_sub_inst) {
