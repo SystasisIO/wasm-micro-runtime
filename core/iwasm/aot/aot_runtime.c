@@ -2691,6 +2691,11 @@ aot_call_function(WASMExecEnv *exec_env, AOTFunctionInstance *function,
     /* Set exec env, so it can be later retrieved from instance */
     module_inst->cur_exec_env = exec_env;
 
+    /* An exported import keeps its native calling convention. The generic
+       compiled-code trampoline does not accept raw (exec_env, uint64*) callbacks. */
+    if (function->is_import_func && function->u.func_import->call_conv_raw)
+        return aot_invoke_native(exec_env, function->func_index, argc, argv);
+
     if (ext_ret_count > 0) {
         uint32 cell_num = 0, i;
         uint8 *ext_ret_types = func_type->types + func_type->param_count + 1;
