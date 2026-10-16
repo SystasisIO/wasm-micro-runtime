@@ -2498,7 +2498,6 @@ jit_stack_size_callback(void *user_data, const char *name, size_t namelen,
     int ret;
 
     bh_assert(comp_ctx != NULL);
-    bh_assert(comp_ctx->jit_stack_sizes != NULL);
 
     if (namelen >= sizeof(buf)) {
         LOG_DEBUG("too long name: %.*s", (int)namelen, name);
@@ -2513,6 +2512,19 @@ jit_stack_size_callback(void *user_data, const char *name, size_t namelen,
         return;
     }
 
+    if (comp_ctx->jit_compile_on_caller_thread) {
+        /* Eager codegen runs before lookup publishes the mapped global. Keep
+           measured values in charged WAMR workspace, then copy after linking. */
+        if (!comp_ctx->jit_pending_stack_sizes || func_idx >= comp_ctx->func_ctx_count
+            || stack_size >= UINT32_MAX)
+            return;
+        call_size = comp_ctx->func_ctxes[func_idx]->stack_consumption_for_func_call;
+        if (stack_size >= UINT32_MAX - call_size)
+            return;
+        comp_ctx->jit_pending_stack_sizes[func_idx] = (uint32)stack_size + call_size;
+        return;
+    }
+    bh_assert(comp_ctx->jit_stack_sizes != NULL);
     bh_assert(func_idx < comp_ctx->func_ctx_count);
     func_ctx = comp_ctx->func_ctxes[func_idx];
     call_size = func_ctx->stack_consumption_for_func_call;
@@ -2555,23 +2567,28 @@ orc_jit_create(AOTCompContext *comp_ctx)
         goto fail;
     }
 
-    LLVMOrcLLLazyJITBuilderSetNumCompileThreads(
-        builder, WASM_ORC_JIT_COMPILE_THREAD_NUM);
+    LLVMOrcLLLazyJITBuilderSetNumCompileThreads(builder,
+        comp_ctx->jit_compile_on_caller_thread ? 0 : WASM_ORC_JIT_COMPILE_THREAD_NUM);
 
     /* Ownership transfer:
        LLVMOrcJITTargetMachineBuilderRef -> LLVMOrcLLJITBuilderRef */
     LLVMOrcLLLazyJITBuilderSetJITTargetMachineBuilder(builder, jtmb);
-    err = LLVMOrcCreateLLLazyJIT(&orc_jit, builder);
+    if (comp_ctx->jit_compile_on_caller_thread)
+        err = LLVMOrcCreateBoundedLLJIT(&orc_jit, builder,
+                                       &comp_ctx->jit_load_budget,
+                                       comp_ctx->jit_native_map_limit);
+    else
+        err = LLVMOrcCreateLLLazyJIT(&orc_jit, builder);
+    /* Both constructors consume the builder on success or failure. */
+    builder = NULL;
     if (err != LLVMErrorSuccess) {
         aot_handle_llvm_errmsg("quited to create llvm lazy orcjit instance",
                                err);
         goto fail;
     }
-    /* Ownership transfer: LLVMOrcLLJITBuilderRef -> LLVMOrcLLJITRef */
-    builder = NULL;
 
 #if WASM_ENABLE_LINUX_PERF != 0
-    if (wasm_runtime_get_linux_perf()) {
+    if (!comp_ctx->jit_compile_on_caller_thread && wasm_runtime_get_linux_perf()) {
         LOG_DEBUG("Enable linux perf support in JIT");
         LLVMOrcObjectLayerRef obj_linking_layer =
             (LLVMOrcObjectLayerRef)LLVMOrcLLLazyJITGetObjLinkingLayer(orc_jit);
@@ -2825,6 +2842,23 @@ aot_create_comp_context(const AOTCompData *comp_data, aot_comp_option_t option)
 
     if (option->is_jit_mode) {
         comp_ctx->is_jit_mode = true;
+        comp_ctx->jit_compile_on_caller_thread = option->jit_compile_on_caller_thread;
+        if (option->jit_compile_on_caller_thread) {
+            if (!option->jit_load_budget) {
+                aot_set_last_error("bounded JIT load owner is required");
+                goto fail;
+            }
+            comp_ctx->jit_load_budget = *option->jit_load_budget;
+            comp_ctx->jit_native_map_limit = option->jit_native_map_limit;
+            uint64 bytes = (uint64)comp_data->func_count * sizeof(uint32);
+            if (bytes && (bytes >= UINT32_MAX
+                || !(comp_ctx->jit_pending_stack_sizes = wasm_runtime_malloc((uint32)bytes)))) {
+                aot_set_last_error("bounded JIT stack workspace allocation failed");
+                goto fail;
+            }
+            if (bytes)
+                memset(comp_ctx->jit_pending_stack_sizes, 0xff, (size_t)bytes);
+        }
 
 #ifndef OS_ENABLE_HW_BOUND_CHECK
         comp_ctx->enable_bound_check = true;
@@ -3527,6 +3561,9 @@ aot_destroy_comp_context(AOTCompContext *comp_ctx)
 
     if (comp_ctx->builder)
         LLVMDisposeBuilder(comp_ctx->builder);
+
+    if (comp_ctx->jit_pending_stack_sizes)
+        wasm_runtime_free(comp_ctx->jit_pending_stack_sizes);
 
 #if WASM_ENABLE_DEBUG_AOT != 0
     if (comp_ctx->debug_builder)

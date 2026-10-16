@@ -97,7 +97,10 @@ MyPassManager::add(llvm::Pass *P)
 llvm::Expected<llvm::orc::SimpleCompiler::CompileResult>
 MyCompiler::operator()(llvm::Module &M)
 {
-    auto TM = cantFail(JTMB.createTargetMachine());
+    auto Target = JTMB.createTargetMachine();
+    if (!Target)
+        return Target.takeError();
+    auto TM = std::move(*Target);
     llvm::SmallVector<char, 0> ObjBufferSV;
 
     {

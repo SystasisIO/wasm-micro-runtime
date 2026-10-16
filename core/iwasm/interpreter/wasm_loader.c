@@ -5887,7 +5887,9 @@ init_fast_jit_functions(WASMModule *module, char *error_buf,
 
 #if WASM_ENABLE_JIT != 0
 static bool
-init_llvm_jit_functions_stage1(WASMModule *module, char *error_buf,
+init_llvm_jit_functions_stage1(WASMModule *module,
+                               const WASMLoadBudget *budget,
+                               uint64 native_map_limit, char *error_buf,
                                uint32 error_buf_size)
 {
     LLVMJITOptions *llvm_jit_options = wasm_runtime_get_llvm_jit_options();
@@ -5934,6 +5936,9 @@ init_llvm_jit_functions_stage1(WASMModule *module, char *error_buf,
     }
 
     option.is_jit_mode = true;
+    option.jit_compile_on_caller_thread = budget != NULL;
+    option.jit_load_budget = budget;
+    option.jit_native_map_limit = native_map_limit;
 
     option.opt_level = llvm_jit_options->opt_level;
     option.size_level = llvm_jit_options->size_level;
@@ -6331,8 +6336,71 @@ wasm_loader_compile_llvm_jit(WASMModule *module, char *error_buf,
 {
     (void)module;
     set_error_buf(error_buf, error_buf_size,
-                  "explicit bounded LLVM JIT is not available in this source profile");
+                  "explicit LLVM JIT requires a native allocation owner");
     return false;
+}
+
+bool
+wasm_loader_compile_llvm_jit_ex(WASMModule *module,
+                                const WASMLoadBudget *budget,
+                                uint64 native_map_limit, char *error_buf,
+                                uint32 error_buf_size)
+{
+#if WASM_ENABLE_JIT != 0 && WASM_ENABLE_FAST_JIT == 0 \
+    && WASM_ENABLE_LAZY_JIT == 0
+    uint32 i;
+    if (!module || module->module_type != Wasm_Module_Bytecode || !budget
+        || !budget->begin_mapping || !budget->complete_mapping || !budget->unmap
+        || !budget->check || !budget->before_protect || !budget->allocation_failed
+        || !budget->protection_failed || !native_map_limit
+        || native_map_limit > ((uint64)1 << 30)) {
+        set_error_buf(error_buf, error_buf_size, "invalid bounded LLVM JIT request");
+        return false;
+    }
+    if (module->comp_ctx || module->comp_data || module->func_ptrs) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT module already has compiler state");
+        return false;
+    }
+    if (!budget->check(budget->context)) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
+        return false;
+    }
+    if (!module->function_count)
+        return true;
+    if (!init_llvm_jit_functions_stage1(module, budget, native_map_limit,
+                                       error_buf, error_buf_size)
+        || !init_llvm_jit_functions_stage2(module, error_buf, error_buf_size))
+        goto fail;
+    /* Eager LLJIT lookup has compiled the complete IR module. Unlike the lazy
+       worker path there is no reason to invoke native wrapper functions. */
+    if (!module->comp_ctx->jit_stack_sizes) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT stack metadata is absent");
+        goto fail;
+    }
+    for (i = 0; i < module->function_count; ++i) {
+        if (!module->func_ptrs[i]
+            || module->comp_ctx->jit_stack_sizes[i] == UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "LLVM JIT materialization is incomplete");
+            goto fail;
+        }
+        module->func_ptrs_compiled[i] = true;
+    }
+    if (!budget->check(budget->context)) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
+        goto fail;
+    }
+    return true;
+fail:
+    destroy_llvm_jit_functions(module);
+    return false;
+#else
+    (void)module;
+    (void)budget;
+    (void)native_map_limit;
+    set_error_buf(error_buf, error_buf_size,
+                  "bounded LLVM JIT requires an LLVM-only eager profile");
+    return false;
+#endif
 }
 
 static bool
@@ -6835,7 +6903,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
 #endif
 
 #if WASM_ENABLE_JIT != 0
-        if (!init_llvm_jit_functions_stage1(module, error_buf,
+        if (!init_llvm_jit_functions_stage1(module, NULL, 0, error_buf,
                                            error_buf_size)) {
             return false;
         }

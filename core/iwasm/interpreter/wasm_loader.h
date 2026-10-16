@@ -30,12 +30,20 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
                  const LoadArgs *args, char *error_buf, uint32 error_buf_size);
 
-/* Reserved explicit prepublication preparation hook. This source profile
-   refuses it without changing module state; the bounded synchronous ORC
-   implementation is not enabled by the admission-only load option. */
+/* The owner-free entry point refuses native preparation without changing
+   module state. Bounded callers must use the explicit owner-bearing API. */
 bool
 wasm_loader_compile_llvm_jit(WASMModule *module, char *error_buf,
                              uint32 error_buf_size);
+
+#define WASM_LOADER_HAS_BOUNDED_LLVM_JIT 1
+/* Synchronous explicit preparation, before instances/publication. Budget and
+   context must outlive the module. No LLVM/loader worker is created. */
+bool
+wasm_loader_compile_llvm_jit_ex(WASMModule *module,
+                                const WASMLoadBudget *budget,
+                                uint64 native_map_limit, char *error_buf,
+                                uint32 error_buf_size);
 
 /**
  * Load a WASM module from a specified WASM section list.

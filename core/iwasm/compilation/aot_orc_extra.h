@@ -11,6 +11,7 @@
 #include "llvm-c/LLJIT.h"
 #include "llvm-c/Orc.h"
 #include "llvm-c/Types.h"
+#include "wasm_export.h"
 
 LLVM_C_EXTERN_C_BEGIN
 
@@ -40,6 +41,13 @@ LLVMOrcLLLazyJITBuilderSetNumCompileThreads(LLVMOrcLLLazyJITBuilderRef Builder,
 LLVMErrorRef
 LLVMOrcCreateLLLazyJIT(LLVMOrcLLLazyJITRef *Result,
                        LLVMOrcLLLazyJITBuilderRef Builder);
+
+/* Consumes Builder on success or failure, like CreateLLLazyJIT. The opaque
+   WAMR handle owns a real eager LLJIT, not a lazy JIT or an AOT substitute. */
+LLVMErrorRef
+LLVMOrcCreateBoundedLLJIT(LLVMOrcLLLazyJITRef *Result,
+                         LLVMOrcLLLazyJITBuilderRef Builder,
+                         const WASMLoadBudget *Budget, uint64_t NativeMapLimit);
 
 LLVMErrorRef
 LLVMOrcDisposeLLLazyJIT(LLVMOrcLLLazyJITRef J);

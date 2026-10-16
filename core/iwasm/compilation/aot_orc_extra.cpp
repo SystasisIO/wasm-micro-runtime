@@ -28,6 +28,7 @@
 
 #include "aot_orc_extra.h"
 #include "aot.h"
+#include "aot_llvm_extra.h"
 
 #if LLVM_VERSION_MAJOR >= 17
 namespace llvm {
@@ -139,7 +140,23 @@ DEFINE_SIMPLE_CONVERSION_FUNCTIONS(ThreadSafeModule, LLVMOrcThreadSafeModuleRef)
 // LLJIT.h
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(LLJITBuilder, LLVMOrcLLJITBuilderRef)
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(LLLazyJITBuilder, LLVMOrcLLLazyJITBuilderRef)
-DEFINE_SIMPLE_CONVERSION_FUNCTIONS(LLLazyJIT, LLVMOrcLLLazyJITRef)
+
+struct WamrOrcJIT {
+    std::unique_ptr<LLJIT> jit;
+    bool lazy;
+};
+DEFINE_SIMPLE_CONVERSION_FUNCTIONS(WamrOrcJIT, LLVMOrcLLLazyJITRef)
+
+static LLVMErrorRef
+own_jit(LLVMOrcLLLazyJITRef *Result, std::unique_ptr<LLJIT> J, bool Lazy)
+{
+    void *storage = wasm_runtime_malloc(sizeof(WamrOrcJIT));
+    if (!storage)
+        return wrap(make_error<StringError>("WAMR JIT handle allocation failed",
+                                             inconvertibleErrorCode()));
+    *Result = wrap(new (storage) WamrOrcJIT{std::move(J), Lazy});
+    return LLVMErrorSuccess;
+}
 
 void
 LLVMOrcLLJITBuilderSetNumCompileThreads(LLVMOrcLLJITBuilderRef Builder,
@@ -256,6 +273,7 @@ LLVMOrcCreateLLLazyJIT(LLVMOrcLLLazyJITRef *Result,
                        LLVMOrcLLLazyJITBuilderRef Builder)
 {
     assert(Result && "Result can not be null");
+    *Result = nullptr;
 
     if (!Builder)
         Builder = LLVMOrcCreateLLLazyJITBuilder();
@@ -264,21 +282,47 @@ LLVMOrcCreateLLLazyJIT(LLVMOrcLLLazyJITRef *Result,
     LLVMOrcDisposeLLLazyJITBuilder(Builder);
 
     if (!J) {
-        Result = nullptr;
-        return 0;
+        return wrap(J.takeError());
     }
 
-    LLLazyJIT *lazy_jit = J->release();
+    auto lazy_jit = std::move(*J);
     lazy_jit->setPartitionFunction(PartitionFunction);
 
-    *Result = wrap(lazy_jit);
-    return LLVMErrorSuccess;
+    return own_jit(Result, std::move(lazy_jit), true);
+}
+
+LLVMErrorRef
+LLVMOrcCreateBoundedLLJIT(LLVMOrcLLLazyJITRef *Result,
+                         LLVMOrcLLLazyJITBuilderRef Builder,
+                         const WASMLoadBudget *Budget, uint64_t NativeMapLimit)
+{
+    assert(Result && "Result can not be null");
+    *Result = nullptr;
+    if (!Builder)
+        Builder = LLVMOrcCreateLLLazyJITBuilder();
+    LLJITBuilder eager;
+    /* Move only common builder state. No lazy call-through/stub manager is
+       constructed, so every native mapping belongs to the object-layer owner. */
+    static_cast<LLJITBuilderState &>(eager) =
+        std::move(static_cast<LLJITBuilderState &>(*unwrap(Builder)));
+    LLVMOrcDisposeLLLazyJITBuilder(Builder);
+    if (auto error = aot_configure_bounded_jit_builder(wrap(&eager), Budget,
+                                                      NativeMapLimit))
+        return error;
+    auto J = eager.create();
+    if (!J)
+        return wrap(J.takeError());
+    return own_jit(Result, std::move(*J), false);
 }
 
 LLVMErrorRef
 LLVMOrcDisposeLLLazyJIT(LLVMOrcLLLazyJITRef J)
 {
-    delete unwrap(J);
+    if (!J)
+        return LLVMErrorSuccess;
+    auto *handle = unwrap(J);
+    handle->~WamrOrcJIT();
+    wasm_runtime_free(handle);
     return LLVMErrorSuccess;
 }
 
@@ -287,7 +331,11 @@ LLVMOrcLLLazyJITAddLLVMIRModule(LLVMOrcLLLazyJITRef J, LLVMOrcJITDylibRef JD,
                                 LLVMOrcThreadSafeModuleRef TSM)
 {
     std::unique_ptr<ThreadSafeModule> TmpTSM(unwrap(TSM));
-    return wrap(unwrap(J)->addLazyIRModule(*unwrap(JD), std::move(*TmpTSM)));
+    auto &handle = *unwrap(J);
+    if (handle.lazy)
+        return wrap(static_cast<LLLazyJIT *>(handle.jit.get())->addLazyIRModule(
+            *unwrap(JD), std::move(*TmpTSM)));
+    return wrap(handle.jit->addIRModule(*unwrap(JD), std::move(*TmpTSM)));
 }
 
 LLVMErrorRef
@@ -296,7 +344,7 @@ LLVMOrcLLLazyJITLookup(LLVMOrcLLLazyJITRef J, LLVMOrcExecutorAddress *Result,
 {
     assert(Result && "Result can not be null");
 
-    auto Sym = unwrap(J)->lookup(Name);
+    auto Sym = unwrap(J)->jit->lookup(Name);
     if (!Sym) {
         *Result = 0;
         return wrap(Sym.takeError());
@@ -316,45 +364,45 @@ LLVMOrcLLLazyJITMangleAndIntern(LLVMOrcLLLazyJITRef J,
 {
 #if LLVM_VERSION_MAJOR < 18
     return wrap(OrcV2CAPIHelper::moveFromSymbolStringPtr(
-        unwrap(J)->mangleAndIntern(UnmangledName)));
+        unwrap(J)->jit->mangleAndIntern(UnmangledName)));
 #else
     return wrap(SymbolStringPoolEntryUnsafe::take(
-        unwrap(J)->mangleAndIntern(UnmangledName)));
+        unwrap(J)->jit->mangleAndIntern(UnmangledName)));
 #endif
 }
 
 LLVMOrcJITDylibRef
 LLVMOrcLLLazyJITGetMainJITDylib(LLVMOrcLLLazyJITRef J)
 {
-    return wrap(&unwrap(J)->getMainJITDylib());
+    return wrap(&unwrap(J)->jit->getMainJITDylib());
 }
 
 const char *
 LLVMOrcLLLazyJITGetTripleString(LLVMOrcLLLazyJITRef J)
 {
-    return unwrap(J)->getTargetTriple().str().c_str();
+    return unwrap(J)->jit->getTargetTriple().str().c_str();
 }
 
 LLVMOrcExecutionSessionRef
 LLVMOrcLLLazyJITGetExecutionSession(LLVMOrcLLLazyJITRef J)
 {
-    return wrap(&unwrap(J)->getExecutionSession());
+    return wrap(&unwrap(J)->jit->getExecutionSession());
 }
 
 LLVMOrcIRTransformLayerRef
 LLVMOrcLLLazyJITGetIRTransformLayer(LLVMOrcLLLazyJITRef J)
 {
-    return wrap(&unwrap(J)->getIRTransformLayer());
+    return wrap(&unwrap(J)->jit->getIRTransformLayer());
 }
 
 LLVMOrcObjectTransformLayerRef
 LLVMOrcLLLazyJITGetObjTransformLayer(LLVMOrcLLLazyJITRef J)
 {
-    return wrap(&unwrap(J)->getObjTransformLayer());
+    return wrap(&unwrap(J)->jit->getObjTransformLayer());
 }
 
 LLVMOrcObjectLayerRef
 LLVMOrcLLLazyJITGetObjLinkingLayer(LLVMOrcLLLazyJITRef J)
 {
-    return wrap(&unwrap(J)->getObjLinkingLayer());
+    return wrap(&unwrap(J)->jit->getObjLinkingLayer());
 }

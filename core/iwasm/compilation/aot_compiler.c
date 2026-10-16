@@ -4103,6 +4103,11 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 
     bh_print_time("Begin to compile WASM bytecode to LLVM IR");
     for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        if (comp_ctx->jit_compile_on_caller_thread
+            && !comp_ctx->jit_load_budget.check(comp_ctx->jit_load_budget.context)) {
+            aot_set_last_error("bounded JIT preparation canceled or unavailable");
+            return false;
+        }
         if (!aot_compile_func(comp_ctx, i)) {
             return false;
         }
@@ -4130,7 +4135,8 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
            JIT: one is memory leak in do_ir_transform, the other is
            possible core dump. */
         bh_print_time("Begin to run llvm optimization passes");
-        aot_apply_llvm_new_pass_manager(comp_ctx, comp_ctx->module);
+        if (!aot_apply_llvm_new_pass_manager(comp_ctx, comp_ctx->module))
+            return false;
         bh_print_time("Finish llvm optimization passes");
     }
 
@@ -4160,10 +4166,7 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 
         if ((err = LLVMOrcLLLazyJITAddLLVMIRModule(
                  comp_ctx->orc_jit, orc_main_dylib, orc_thread_safe_module))) {
-            /* If adding the ThreadSafeModule fails then we need to clean it up
-               by ourselves, otherwise the orc orc_jit will manage the memory.
-             */
-            LLVMOrcDisposeThreadSafeModule(orc_thread_safe_module);
+            /* The wrapper consumes the thread-safe module on both paths. */
             aot_handle_llvm_errmsg("failed to addIRModule", err);
             return false;
         }
@@ -4176,6 +4179,21 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
                 return false;
             }
             comp_ctx->jit_stack_sizes = (uint32 *)addr;
+            if (comp_ctx->jit_compile_on_caller_thread) {
+                if (!comp_ctx->jit_pending_stack_sizes) {
+                    aot_set_last_error("bounded JIT stack measurements are absent");
+                    return false;
+                }
+                for (i = 0; i < comp_ctx->func_ctx_count; ++i) {
+                    if (comp_ctx->jit_pending_stack_sizes[i] == UINT32_MAX) {
+                        aot_set_last_error("bounded JIT stack measurements are incomplete");
+                        return false;
+                    }
+                    comp_ctx->jit_stack_sizes[i] = comp_ctx->jit_pending_stack_sizes[i];
+                }
+                wasm_runtime_free(comp_ctx->jit_pending_stack_sizes);
+                comp_ctx->jit_pending_stack_sizes = NULL;
+            }
         }
     }
 

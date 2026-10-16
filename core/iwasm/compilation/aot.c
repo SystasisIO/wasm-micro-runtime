@@ -5,7 +5,11 @@
 
 #include "aot.h"
 
-static char aot_error[128];
+#ifdef os_thread_local_attribute
+static os_thread_local_attribute char aot_error[128];
+#else
+static _Thread_local char aot_error[128];
+#endif
 
 char *
 aot_get_last_error(void)
