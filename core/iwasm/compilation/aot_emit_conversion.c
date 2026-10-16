@@ -756,7 +756,7 @@ aot_compile_op_f32_demote_f64(AOTCompContext *comp_ctx,
         return false;
     }
 
-    PUSH_F32(res);
+    PUSH_F32(aot_canonicalize_nan(comp_ctx, res, true));
     return true;
 fail:
     return false;
@@ -865,7 +865,7 @@ aot_compile_op_f64_promote_f32(AOTCompContext *comp_ctx,
         return false;
     }
 
-    PUSH_F64(res);
+    PUSH_F64(aot_canonicalize_nan(comp_ctx, res, false));
 
     /* Avoid the promote being optimized away */
     PUSH_F64(F64_CONST(1.0));

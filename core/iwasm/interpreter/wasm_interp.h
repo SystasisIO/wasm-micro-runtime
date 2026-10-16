@@ -98,7 +98,8 @@ wasm_interp_interp_frame_size(unsigned all_cell_num)
 #else
     frame_size = (uint32)offsetof(WASMInterpFrame, operand) + all_cell_num * 4;
 #endif
-    return align_uint(frame_size, 4);
+    /* Frames contain native pointers, even though operands use 32-bit cells. */
+    return align_uint(frame_size, sizeof(void *));
 }
 
 void

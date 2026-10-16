@@ -10,6 +10,7 @@
 #include "wasm_loader.h"
 #include "wasm_memory.h"
 #include "../common/wasm_exec_env.h"
+#include "../common/wasm_canonical_nan.h"
 #if WASM_ENABLE_GC != 0
 #include "../common/gc/gc_object.h"
 #include "mem_alloc.h"
@@ -859,6 +860,19 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
         src_type src_val;                          \
         src_val = POP_##src_op_type();             \
         PUSH_##src_op_type(method(src_val));       \
+    } while (0)
+
+#define DEF_OP_FP_NUMERIC(type, kind, op) \
+    do { \
+        type right = POP_##kind(); \
+        type left = POP_##kind(); \
+        PUSH_##kind(wasm_canonical_##kind(left op right)); \
+    } while (0)
+
+#define DEF_OP_FP_MATH(type, kind, method) \
+    do { \
+        type value = POP_##kind(); \
+        PUSH_##kind(wasm_canonical_##kind(method(value))); \
     } while (0)
 
 #define TRUNC_FUNCTION(func_name, src_type, dst_type, signed_type)  \
@@ -5299,55 +5313,55 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_CEIL)
             {
-                DEF_OP_MATH(float32, F32, ceilf);
+                DEF_OP_FP_MATH(float32, F32, ceilf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_FLOOR)
             {
-                DEF_OP_MATH(float32, F32, floorf);
+                DEF_OP_FP_MATH(float32, F32, floorf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_TRUNC)
             {
-                DEF_OP_MATH(float32, F32, truncf);
+                DEF_OP_FP_MATH(float32, F32, truncf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_NEAREST)
             {
-                DEF_OP_MATH(float32, F32, rintf);
+                DEF_OP_FP_MATH(float32, F32, rintf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SQRT)
             {
-                DEF_OP_MATH(float32, F32, sqrtf);
+                DEF_OP_FP_MATH(float32, F32, sqrtf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_ADD)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, +);
+                DEF_OP_FP_NUMERIC(float32, F32, +);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SUB)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, -);
+                DEF_OP_FP_NUMERIC(float32, F32, -);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_MUL)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, *);
+                DEF_OP_FP_NUMERIC(float32, F32, *);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_DIV)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, /);
+                DEF_OP_FP_NUMERIC(float32, F32, /);
                 HANDLE_OP_END();
             }
 
@@ -5403,55 +5417,55 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_CEIL)
             {
-                DEF_OP_MATH(float64, F64, ceil);
+                DEF_OP_FP_MATH(float64, F64, ceil);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_FLOOR)
             {
-                DEF_OP_MATH(float64, F64, floor);
+                DEF_OP_FP_MATH(float64, F64, floor);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_TRUNC)
             {
-                DEF_OP_MATH(float64, F64, trunc);
+                DEF_OP_FP_MATH(float64, F64, trunc);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_NEAREST)
             {
-                DEF_OP_MATH(float64, F64, rint);
+                DEF_OP_FP_MATH(float64, F64, rint);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SQRT)
             {
-                DEF_OP_MATH(float64, F64, sqrt);
+                DEF_OP_FP_MATH(float64, F64, sqrt);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_ADD)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, +);
+                DEF_OP_FP_NUMERIC(float64, F64, +);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SUB)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, -);
+                DEF_OP_FP_NUMERIC(float64, F64, -);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_MUL)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, *);
+                DEF_OP_FP_NUMERIC(float64, F64, *);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_DIV)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, /);
+                DEF_OP_FP_NUMERIC(float64, F64, /);
                 HANDLE_OP_END();
             }
 
@@ -5597,7 +5611,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_DEMOTE_F64)
             {
-                DEF_OP_CONVERT(float32, F32, float64, F64);
+                float64 value = POP_F64();
+                PUSH_F32(wasm_canonical_F32((float32)value));
                 HANDLE_OP_END();
             }
 
@@ -5628,7 +5643,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_PROMOTE_F32)
             {
-                DEF_OP_CONVERT(float64, F64, float32, F32);
+                float32 value = POP_F32();
+                PUSH_F64(wasm_canonical_F64((float64)value));
                 HANDLE_OP_END();
             }
 
@@ -6788,6 +6804,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             cell_num_of_local_stack = cur_func->param_cell_num
                                       + cur_func->local_cell_num
                                       + max_stack_cell_num;
+            /* Branch blocks contain pointers and cannot start on an odd cell. */
+            cell_num_of_local_stack = align_uint(cell_num_of_local_stack,
+                                                 sizeof(void *) / sizeof(uint32));
             all_cell_num = cell_num_of_local_stack
                            + cur_wasm_func->max_block_num
                                  * (uint32)sizeof(WASMBranchBlock) / 4;
@@ -6818,7 +6837,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             frame->sp_boundary = frame->sp_bottom + max_stack_cell_num;
 
             frame_csp = frame->csp_bottom =
-                (WASMBranchBlock *)frame->sp_boundary;
+                (WASMBranchBlock *)(frame_lp + cell_num_of_local_stack);
             frame->csp_boundary =
                 frame->csp_bottom + cur_wasm_func->max_block_num;
 

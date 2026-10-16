@@ -10,6 +10,7 @@
 #include "wasm_native.h"
 #include "wasm_runtime_common.h"
 #include "wasm_memory.h"
+#include "wasm_fp_environment.h"
 #if WASM_ENABLE_INTERP != 0
 #include "../interpreter/wasm_runtime.h"
 #endif
@@ -1658,8 +1659,8 @@ wasm_runtime_get_max_mem(uint32 max_memory_pages, uint32 module_init_page_count,
     return max_memory_pages;
 }
 
-WASMModuleInstanceCommon *
-wasm_runtime_instantiate_internal(WASMModuleCommon *module,
+static WASMModuleInstanceCommon *
+instantiate_unguarded(WASMModuleCommon *module,
                                   WASMModuleInstanceCommon *parent,
                                   WASMExecEnv *exec_env_main,
                                   const struct InstantiationArgs2 *args,
@@ -1680,6 +1681,30 @@ wasm_runtime_instantiate_internal(WASMModuleCommon *module,
     set_error_buf(error_buf, error_buf_size,
                   "Instantiate module failed, invalid module type");
     return NULL;
+}
+
+WASMModuleInstanceCommon *
+wasm_runtime_instantiate_internal(WASMModuleCommon *module,
+                                  WASMModuleInstanceCommon *parent,
+                                  WASMExecEnv *exec_env_main,
+                                  const struct InstantiationArgs2 *args,
+                                  char *error_buf, uint32 error_buf_size)
+{
+    WASMFPEnvironment env;
+    WASMModuleInstanceCommon *result;
+    if (!wasm_fp_enter(&env)) {
+        set_error_buf(error_buf, error_buf_size, "FP environment setup failed");
+        return NULL;
+    }
+    result = instantiate_unguarded(module, parent, exec_env_main, args,
+                                   error_buf, error_buf_size);
+    if (!wasm_fp_leave(&env)) {
+        if (result)
+            wasm_runtime_deinstantiate(result);
+        set_error_buf(error_buf, error_buf_size, "FP environment restore failed");
+        return NULL;
+    }
+    return result;
 }
 
 void
@@ -2764,8 +2789,8 @@ wasm_runtime_finalize_call_function(WASMExecEnv *exec_env,
 }
 #endif
 
-bool
-wasm_runtime_call_wasm(WASMExecEnv *exec_env,
+static bool
+call_wasm_unguarded(WASMExecEnv *exec_env,
                        WASMFunctionInstanceCommon *function, uint32 argc,
                        uint32 argv[])
 {
@@ -2820,6 +2845,19 @@ wasm_runtime_call_wasm(WASMExecEnv *exec_env,
 #endif
 
     return ret;
+}
+
+bool
+wasm_runtime_call_wasm(WASMExecEnv *exec_env,
+                       WASMFunctionInstanceCommon *function, uint32 argc,
+                       uint32 argv[])
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env))
+        return false;
+    result = call_wasm_unguarded(exec_env, function, argc, argv);
+    return wasm_fp_leave(&env) && result;
 }
 
 static void
@@ -4899,8 +4937,8 @@ wasm_runtime_unregister_natives(const char *module_name,
     return wasm_native_unregister_natives(module_name, native_symbols);
 }
 
-bool
-wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_raw_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                                const WASMFuncType *func_type,
                                const char *signature, void *attachment,
                                uint32 *argv, uint32 argc, uint32 *argv_ret)
@@ -5187,8 +5225,8 @@ static volatile VoidFuncPtr invokeNative_Void =
 #define MAX_REG_FLOATS 8
 #endif
 
-bool
-wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                            const WASMFuncType *func_type, const char *signature,
                            void *attachment, uint32 *argv, uint32 argc,
                            uint32 *argv_ret)
@@ -5751,8 +5789,8 @@ word_copy(uint32 *dest, uint32 *src, unsigned num)
         *dest++ = *src++;
 }
 
-bool
-wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                            const WASMFuncType *func_type, const char *signature,
                            void *attachment, uint32 *argv, uint32 argc,
                            uint32 *argv_ret)
@@ -6059,8 +6097,8 @@ static V128FuncPtr invokeNative_V128 = (V128FuncPtr)(uintptr_t)invokeNative;
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((no_sanitize_address))
 #endif
-bool
-wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                            const WASMFuncType *func_type, const char *signature,
                            void *attachment, uint32 *argv, uint32 argc,
                            uint32 *argv_ret)
@@ -6403,7 +6441,37 @@ fail:
                  || defined(BUILD_TARGET_RISCV64_LP64) */
 
 bool
-wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
+wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+                           const WASMFuncType *func_type, const char *signature,
+                           void *attachment, uint32 *argv, uint32 argc,
+                           uint32 *argv_ret)
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env))
+        return false;
+    result = invoke_native_unguarded(exec_env, func_ptr, func_type, signature,
+                                     attachment, argv, argc, argv_ret);
+    return wasm_fp_leave(&env) && result;
+}
+
+bool
+wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
+                               const WASMFuncType *func_type, const char *signature,
+                               void *attachment, uint32 *argv, uint32 argc,
+                               uint32 *argv_ret)
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env))
+        return false;
+    result = invoke_native_raw_unguarded(exec_env, func_ptr, func_type, signature,
+                                         attachment, argv, argc, argv_ret);
+    return wasm_fp_leave(&env) && result;
+}
+
+static bool
+call_indirect_unguarded(WASMExecEnv *exec_env, uint32 element_index,
                            uint32 argc, uint32 argv[])
 {
     bool ret = false;
@@ -6427,6 +6495,18 @@ wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
 #endif
 
     return ret;
+}
+
+bool
+wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
+                           uint32 argc, uint32 argv[])
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env))
+        return false;
+    result = call_indirect_unguarded(exec_env, element_index, argc, argv);
+    return wasm_fp_leave(&env) && result;
 }
 
 static void

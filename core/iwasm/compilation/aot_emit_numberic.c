@@ -11,6 +11,20 @@
 
 #include <stdarg.h>
 
+LLVMValueRef
+aot_canonicalize_nan(AOTCompContext *comp_ctx, LLVMValueRef value, bool is_f32)
+{
+    LLVMTypeRef integer = is_f32 ? I32_TYPE : I64_TYPE;
+    LLVMValueRef bits = LLVMBuildBitCast(comp_ctx->builder, value, integer, "fp_bits");
+    LLVMValueRef magnitude = LLVMBuildAnd(comp_ctx->builder, bits,
+        LLVMConstInt(integer, is_f32 ? 0x7fffffffULL : 0x7fffffffffffffffULL, false), "fp_magnitude");
+    LLVMValueRef nan = LLVMBuildICmp(comp_ctx->builder, LLVMIntUGT, magnitude,
+        LLVMConstInt(integer, is_f32 ? 0x7f800000ULL : 0x7ff0000000000000ULL, false), "is_nan");
+    LLVMValueRef selected = LLVMBuildSelect(comp_ctx->builder, nan,
+        LLVMConstInt(integer, is_f32 ? 0x7fc00000ULL : 0x7ff8000000000000ULL, false), bits, "canonical_nan");
+    return LLVMBuildBitCast(comp_ctx->builder, selected, is_f32 ? F32_TYPE : F64_TYPE, "canonical_fp");
+}
+
 #define LLVM_BUILD_ICMP(op, left, right, res, name)                           \
     do {                                                                      \
         if (!(res =                                                           \
@@ -135,6 +149,8 @@
                 aot_set_last_error(err); \
             return false;                \
         }                                \
+        if (math_op != FLOAT_ABS && math_op != FLOAT_NEG) \
+            res = aot_canonicalize_nan(comp_ctx, res, is_f32); \
         PUSH_FLOAT(res);                 \
     } while (0)
 
@@ -148,6 +164,8 @@
                 aot_set_last_error(err); \
             return false;                \
         }                                \
+        if (canonicalize) \
+            res = aot_canonicalize_nan(comp_ctx, res, is_f32); \
         PUSH_FLOAT(res);                 \
     } while (0)
 
@@ -949,6 +967,7 @@ static bool
 compile_op_float_arithmetic(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                             FloatArithmetic arith_op, bool is_f32)
 {
+    const bool canonicalize = true;
     switch (arith_op) {
         case FLOAT_ADD:
             if (is_targeting_soft_float(comp_ctx, is_f32))
@@ -1130,6 +1149,7 @@ static bool
 compile_float_copysign(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                        bool is_f32)
 {
+    const bool canonicalize = false;
     LLVMTypeRef ret_type, param_types[2];
 
     param_types[0] = param_types[1] = ret_type = is_f32 ? F32_TYPE : F64_TYPE;

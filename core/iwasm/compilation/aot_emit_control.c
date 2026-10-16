@@ -941,14 +941,8 @@ check_suspend_flags(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     LLVMValueRef terminate_addr, terminate_flags, flag, offset, res;
     LLVMBasicBlockRef terminate_block, non_terminate_block;
     AOTFuncType *aot_func_type = func_ctx->aot_func->func_type;
-    bool is_shared_memory =
-        comp_ctx->comp_data->memories[0].flags & 0x02 ? true : false;
-
-    /* Only need to check the suspend flags when memory is shared since
-       shared memory must be enabled for multi-threading */
-    if (!is_shared_memory) {
-        return true;
-    }
+    /* Host cancellation also applies to single-threaded, ordinary-memory
+       modules. It must not depend on guest shared-memory admission. */
 
     /* Offset of suspend_flags */
     offset = I32_FIVE;
@@ -975,6 +969,8 @@ check_suspend_flags(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     /* Set terminate_flags memory access to volatile, so that the value
         will always be loaded from memory rather than register */
     LLVMSetVolatile(terminate_flags, true);
+    LLVMSetOrdering(terminate_flags, LLVMAtomicOrderingAcquire);
+    LLVMSetAlignment(terminate_flags, 4);
 
     if (!(flag = LLVMBuildAnd(comp_ctx->builder, terminate_flags, I32_ONE,
                               "termination_flag"))) {
