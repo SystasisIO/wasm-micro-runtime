@@ -7286,10 +7286,18 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
                  const LoadArgs *args, char *error_buf, uint32 error_buf_size)
 {
-    WASMModule *module = create_module(args->name, error_buf, error_buf_size);
+    WASMModule *module;
+    if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD
+        && args->block_type_mode != WASM_BLOCK_TYPES_NUMERIC
+        && args->block_type_mode != WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO) {
+        set_error_buf(error_buf, error_buf_size, "invalid block type mode");
+        return NULL;
+    }
+    module = create_module(args->name, error_buf, error_buf_size);
     if (!module) {
         return NULL;
     }
+    module->forge_block_type_mode = (uint8)args->block_type_mode;
 
 #if WASM_ENABLE_DEBUG_INTERP != 0 || WASM_ENABLE_FAST_JIT != 0 \
     || WASM_ENABLE_DUMP_CALL_STACK != 0 || WASM_ENABLE_JIT != 0
@@ -12083,6 +12091,23 @@ re_scan:
 
                 CHECK_BUF(p, p_end, 1);
                 value_type = read_uint8(p);
+                if (module->forge_block_type_mode != WASM_BLOCK_TYPES_STANDARD) {
+                    if (value_type == 0
+                        && module->forge_block_type_mode
+                               == WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO) {
+                        value_type = VALUE_TYPE_VOID;
+                        *(p - 1) = VALUE_TYPE_VOID;
+                    }
+                    else if (value_type != VALUE_TYPE_VOID
+                             && value_type != VALUE_TYPE_I32
+                             && value_type != VALUE_TYPE_I64
+                             && value_type != VALUE_TYPE_F32
+                             && value_type != VALUE_TYPE_F64) {
+                        set_error_buf(error_buf, error_buf_size,
+                                      "unsupported numeric block type");
+                        goto fail;
+                    }
+                }
                 if (is_byte_a_type(value_type)) {
                     /* If the first byte is one of these special values:
                      * 0x40/0x7F/0x7E/0x7D/0x7C, take it as the type of

@@ -261,6 +261,12 @@ typedef struct RuntimeInitArgs {
 
 #ifndef LOAD_ARGS_OPTION_DEFINED
 #define LOAD_ARGS_OPTION_DEFINED
+typedef enum WASMBlockTypeMode {
+    WASM_BLOCK_TYPES_STANDARD = 0,
+    WASM_BLOCK_TYPES_NUMERIC = 1,
+    WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO = 2
+} WASMBlockTypeMode;
+
 typedef struct LoadArgs {
     char *name;
     /* This option is only used by the Wasm C API (see wasm_c_api.h) */
@@ -275,6 +281,10 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    /* Standard defaults preserve upstream typed-block semantics. Numeric
+       profiles admit only one-byte numeric/void block types; the legacy mode
+       additionally normalizes a literal zero byte to void in the owned input. */
+    WASMBlockTypeMode block_type_mode;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */

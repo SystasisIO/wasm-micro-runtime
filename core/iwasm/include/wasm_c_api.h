@@ -528,6 +528,12 @@ typedef struct WASMModuleCommon *wasm_module_t;
 
 #ifndef LOAD_ARGS_OPTION_DEFINED
 #define LOAD_ARGS_OPTION_DEFINED
+typedef enum WASMBlockTypeMode {
+    WASM_BLOCK_TYPES_STANDARD = 0,
+    WASM_BLOCK_TYPES_NUMERIC = 1,
+    WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO = 2
+} WASMBlockTypeMode;
+
 typedef struct LoadArgs {
     char *name;
     /* True by default, used by wasm-c-api only.
@@ -540,6 +546,9 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    /* Keep this layout synchronized with wasm_export.h. Nonstandard block
+       modes are not supported by the C API's WASM-only module cache. */
+    WASMBlockTypeMode block_type_mode;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */

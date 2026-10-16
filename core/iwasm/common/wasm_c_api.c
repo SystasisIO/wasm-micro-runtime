@@ -2282,6 +2282,9 @@ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
     }
 
 #if WASM_ENABLE_WASM_CACHE != 0
+    /* A binary-only cache key cannot preserve a caller's admission policy. */
+    if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD)
+        goto quit;
     /* if cached */
     SHA256((void *)binary->data, binary->num_elems, (uint8_t *)binary_hash);
     module_ex = try_reuse_loaded_module(store, binary_hash);

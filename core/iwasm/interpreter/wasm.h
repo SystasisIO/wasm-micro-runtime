@@ -924,6 +924,7 @@ struct WASMModule {
     uint32 function_count;
     uint64 forge_legacy_depth;
     uint64 forge_max_legacy_depth;
+    uint8 forge_block_type_mode;
     uint32 table_count;
     uint32 memory_count;
 #if WASM_ENABLE_TAGS != 0
