@@ -6299,25 +6299,25 @@ invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
 #endif
 #endif
                 if (n_ints < MAX_REG_INTS)
-                    ints[n_ints++] = *(uint64 *)argv_src;
+                    ints[n_ints++] = GET_I64_FROM_ADDR(argv_src);
                 else
-                    stacks[n_stacks++] = *(uint64 *)argv_src;
+                    stacks[n_stacks++] = GET_I64_FROM_ADDR(argv_src);
                 argv_src += 2;
                 break;
             case VALUE_TYPE_F32:
                 if (n_fps < MAX_REG_FLOATS) {
-                    *(float32 *)&fps[n_fps++] = *(float32 *)argv_src++;
+                    memcpy(&fps[n_fps++], argv_src++, sizeof(float32));
                 }
                 else {
-                    *(float32 *)&stacks[n_stacks++] = *(float32 *)argv_src++;
+                    memcpy(&stacks[n_stacks++], argv_src++, sizeof(float32));
                 }
                 break;
             case VALUE_TYPE_F64:
                 if (n_fps < MAX_REG_FLOATS) {
-                    *(float64 *)&fps[n_fps++] = *(float64 *)argv_src;
+                    memcpy(&fps[n_fps++], argv_src, sizeof(float64));
                 }
                 else {
-                    *(float64 *)&stacks[n_stacks++] = *(float64 *)argv_src;
+                    memcpy(&stacks[n_stacks++], argv_src, sizeof(float64));
                 }
                 argv_src += 2;
                 break;
@@ -6366,9 +6366,9 @@ invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
     /* Save extra result values' address to argv1 */
     for (i = 0; i < ext_ret_count; i++) {
         if (n_ints < MAX_REG_INTS)
-            ints[n_ints++] = *(uint64 *)argv_src;
+            ints[n_ints++] = GET_I64_FROM_ADDR(argv_src);
         else
-            stacks[n_stacks++] = *(uint64 *)argv_src;
+            stacks[n_stacks++] = GET_I64_FROM_ADDR(argv_src);
         argv_src += 2;
     }
 

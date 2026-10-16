@@ -98,8 +98,9 @@ init_plt_table(uint8 *plt)
         *p++ = 0xd63f03c0; /* blr  x30          */
         *p++ = 0xf84107fe; /* ldr  x30, [sp], #16  */
         *p++ = 0xd61f03c0; /* br   x30          */
-        /* symbol addr */
-        *(uint64 *)p = (uint64)(uintptr_t)target_sym_map[i].symbol_addr;
+        /* Code/PLT can be four-byte aligned, unlike a uint64 lvalue. */
+        uint64 address = (uint64)(uintptr_t)target_sym_map[i].symbol_addr;
+        memcpy(p, &address, sizeof(address));
         p += 2;
         plt += get_plt_item_size();
     }
