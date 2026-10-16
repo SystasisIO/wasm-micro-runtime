@@ -1797,17 +1797,25 @@ wasm_runtime_instantiation_args_set_defer_start(struct InstantiationArgs2 *p,
 bool
 wasm_runtime_initialize(WASMModuleInstanceCommon *module_inst)
 {
+    return wasm_runtime_initialize_with_exec_env(module_inst, NULL);
+}
+
+bool
+wasm_runtime_initialize_with_exec_env(WASMModuleInstanceCommon *module_inst,
+                                      WASMExecEnv *exec_env)
+{
     WASMFPEnvironment env;
     bool result = false;
-    if (!module_inst || !wasm_fp_enter(&env))
+    if (!module_inst || (exec_env && exec_env->module_inst != module_inst)
+        || !wasm_fp_enter(&env))
         return false;
 #if WASM_ENABLE_INTERP != 0
     if (module_inst->module_type == Wasm_Module_Bytecode)
-        result = wasm_initialize((WASMModuleInstance *)module_inst);
+        result = wasm_initialize((WASMModuleInstance *)module_inst, exec_env);
 #endif
 #if WASM_ENABLE_AOT != 0
     if (module_inst->module_type == Wasm_Module_AoT)
-        result = aot_initialize((AOTModuleInstance *)module_inst);
+        result = aot_initialize((AOTModuleInstance *)module_inst, exec_env);
 #endif
     return wasm_fp_leave(&env) && result;
 }

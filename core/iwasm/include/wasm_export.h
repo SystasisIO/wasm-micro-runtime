@@ -794,6 +794,10 @@ wasm_runtime_instantiation_args_set_defer_start(struct InstantiationArgs2 *p,
 WASM_RUNTIME_API_EXTERN bool
 wasm_runtime_initialize(wasm_module_inst_t module_inst);
 
+WASM_RUNTIME_API_EXTERN bool
+wasm_runtime_initialize_with_exec_env(wasm_module_inst_t module_inst,
+                                      wasm_exec_env_t exec_env);
+
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_wasi_arg(struct InstantiationArgs2 *p,
                                              char *argv[], int argc);

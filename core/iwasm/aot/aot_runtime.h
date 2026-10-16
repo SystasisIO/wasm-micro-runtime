@@ -563,7 +563,7 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
  * @param is_sub_inst the flag of sub instance
  */
 bool
-aot_initialize(AOTModuleInstance *module_inst);
+aot_initialize(AOTModuleInstance *module_inst, WASMExecEnv *exec_env);
 
 void
 aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst);

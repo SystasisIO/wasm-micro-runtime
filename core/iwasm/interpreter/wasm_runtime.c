@@ -1712,8 +1712,10 @@ execute_post_instantiate_functions(WASMModuleInstance *module_inst,
     }
     else {
         /* Try using the existing exec_env */
+        exec_env = exec_env_main;
 #ifdef OS_ENABLE_HW_BOUND_CHECK
-        exec_env = exec_env_tls;
+        if (!exec_env)
+            exec_env = exec_env_tls;
 #endif
 #if WASM_ENABLE_THREAD_MGR != 0
         if (!exec_env)
@@ -1781,14 +1783,14 @@ fail:
 }
 
 bool
-wasm_initialize(WASMModuleInstance *module_inst)
+wasm_initialize(WASMModuleInstance *module_inst, WASMExecEnv *exec_env)
 {
     if (!module_inst->e->common.initialization_pending) {
         wasm_set_exception(module_inst, "initialization is not pending");
         return false;
     }
     module_inst->e->common.initialization_pending = false;
-    return execute_post_instantiate_functions(module_inst, false, NULL);
+    return execute_post_instantiate_functions(module_inst, false, exec_env);
 }
 
 static bool

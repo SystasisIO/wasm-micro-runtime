@@ -87,6 +87,11 @@ typedef struct WASMExecEnv {
         uint8 *bottom;
     } wasm_stack;
 
+    /* Shared fixed-layout prefix used by Forge's interpreter and AOT profile. */
+    uint32 forge_call_depth;
+    uint32 forge_max_call_depth;
+    uint32 forge_depth_exceeded;
+
 #if WASM_ENABLE_INSTRUCTION_METERING != 0
     /* instructions to execute */
     int instructions_to_execute;

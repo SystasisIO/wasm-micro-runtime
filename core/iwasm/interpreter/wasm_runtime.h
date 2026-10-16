@@ -341,7 +341,7 @@ typedef struct WASMModuleInstanceExtraCommon {
 } WASMModuleInstanceExtraCommon;
 
 bool
-wasm_initialize(WASMModuleInstance *module_inst);
+wasm_initialize(WASMModuleInstance *module_inst, WASMExecEnv *exec_env);
 
 /* Extra info of WASM module instance for interpreter/jit mode */
 typedef struct WASMModuleInstanceExtra {

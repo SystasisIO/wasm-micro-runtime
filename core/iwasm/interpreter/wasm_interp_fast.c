@@ -1511,7 +1511,7 @@ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
 }
 
 static void
-wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+wasm_interp_call_func_bytecode_inner(WASMModuleInstance *module,
                                WASMExecEnv *exec_env,
                                WASMFunctionInstance *cur_func,
                                WASMInterpFrame *prev_frame)
@@ -7699,6 +7699,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
     call_func_from_entry:
     {
+        if (!cur_func->is_import_func) {
+            if (exec_env->forge_call_depth >= exec_env->forge_max_call_depth) {
+                exec_env->forge_depth_exceeded = 1;
+                wasm_set_exception(module, "Forge logical call depth exceeded");
+                return;
+            }
+            exec_env->forge_call_depth++;
+        }
         if (cur_func->is_import_func) {
 #if WASM_ENABLE_MULTI_MODULE != 0
             if (cur_func->import_func_inst) {
@@ -7819,6 +7827,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
     return_func:
     {
+        exec_env->forge_call_depth--;
         FREE_FRAME(exec_env, frame);
         wasm_exec_env_set_cur_frame(exec_env, (WASMRuntimeFrame *)prev_frame);
 
@@ -7857,6 +7866,16 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #else
     FETCH_OPCODE_AND_DISPATCH();
 #endif
+}
+
+static void
+wasm_interp_call_func_bytecode(WASMModuleInstance *module, WASMExecEnv *exec_env,
+                               WASMFunctionInstance *function, WASMInterpFrame *frame)
+{
+    uint32 depth = exec_env ? exec_env->forge_call_depth : 0;
+    wasm_interp_call_func_bytecode_inner(module, exec_env, function, frame);
+    if (exec_env)
+        exec_env->forge_call_depth = depth;
 }
 
 #if WASM_ENABLE_LABELS_AS_VALUES != 0

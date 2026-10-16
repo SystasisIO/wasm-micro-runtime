@@ -33,6 +33,7 @@
 #include "../aot/aot_runtime.h"
 #include "../interpreter/wasm_opcode.h"
 #include <errno.h>
+#include <stddef.h>
 
 #if WASM_ENABLE_DEBUG_AOT != 0
 #include "debug/dwarf_extractor.h"
@@ -992,6 +993,64 @@ init_comp_frame(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
        and all stack cells' ref flags since they have been initialized
        as 0 (uncommitted and not-reference) by the memset above */
 
+    return true;
+}
+
+static bool
+forge_instrument_call_depth(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
+{
+    /* Count logical WASM frames, independent of LLVM inlining, native stack
+       layout and return path. The incoming value dominates every return. */
+    LLVMValueRef function = func_ctx->func;
+    LLVMValueRef env = LLVMGetParam(function, 0);
+    LLVMBasicBlockRef body = LLVMGetEntryBasicBlock(function);
+    LLVMBasicBlockRef entry = LLVMInsertBasicBlockInContext(comp_ctx->context, body, "forge_depth_entry");
+    LLVMBasicBlockRef admitted = LLVMAppendBasicBlockInContext(comp_ctx->context, function, "forge_depth_admitted");
+    LLVMBasicBlockRef denied = LLVMAppendBasicBlockInContext(comp_ctx->context, function, "forge_depth_denied");
+    LLVMValueRef offset, depth_ptr, maximum_ptr, failed_ptr, depth, maximum, condition, module_ptr, instance;
+    LLVMTypeRef parameters[2] = { INT8_PTR_TYPE, I32_TYPE };
+    LLVMTypeRef signature = LLVMFunctionType(VOID_TYPE, parameters, 2, false);
+    LLVMTypeRef result_type = LLVMGetReturnType(LLVMGlobalGetValueType(function));
+    LLVMValueRef setter = LLVMGetNamedFunction(comp_ctx->module, "aot_set_exception_with_id");
+    LLVMValueRef arguments[2];
+    LLVMBasicBlockRef block;
+    if (!entry || !admitted || !denied)
+        return false;
+    if (!setter)
+        setter = LLVMAddFunction(comp_ctx->module, "aot_set_exception_with_id", signature);
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, entry);
+    offset = I32_CONST(offsetof(WASMExecEnv, forge_call_depth));
+    depth_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "depth_ptr");
+    offset = I32_CONST(offsetof(WASMExecEnv, forge_max_call_depth));
+    maximum_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "maximum_ptr");
+    offset = I32_CONST(offsetof(WASMExecEnv, forge_depth_exceeded));
+    failed_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "depth_failure_ptr");
+    depth = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE, depth_ptr, "incoming_depth");
+    maximum = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE, maximum_ptr, "maximum_depth");
+    condition = LLVMBuildICmp(comp_ctx->builder, LLVMIntULT, depth, maximum, "depth_admitted");
+    LLVMBuildCondBr(comp_ctx->builder, condition, admitted, denied);
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, admitted);
+    LLVMBuildStore(comp_ctx->builder, LLVMBuildAdd(comp_ctx->builder, depth, I32_ONE, "next_depth"), depth_ptr);
+    LLVMBuildBr(comp_ctx->builder, body);
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, denied);
+    LLVMBuildStore(comp_ctx->builder, I32_ONE, failed_ptr);
+    offset = I32_CONST(offsetof(WASMExecEnv, module_inst));
+    module_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "module_ptr");
+    instance = LLVMBuildLoad2(comp_ctx->builder, INT8_PTR_TYPE, module_ptr, "instance");
+    arguments[0] = instance;
+    arguments[1] = I32_CONST(EXCE_NATIVE_STACK_OVERFLOW);
+    LLVMBuildCall2(comp_ctx->builder, signature, setter, arguments, 2, "");
+    if (LLVMGetTypeKind(result_type) == LLVMVoidTypeKind)
+        LLVMBuildRetVoid(comp_ctx->builder);
+    else
+        LLVMBuildRet(comp_ctx->builder, LLVMConstNull(result_type));
+    for (block = LLVMGetFirstBasicBlock(function); block; block = LLVMGetNextBasicBlock(block)) {
+        LLVMValueRef end = LLVMGetBasicBlockTerminator(block);
+        if (end && LLVMIsAReturnInst(end)) {
+            LLVMPositionBuilderBefore(comp_ctx->builder, end);
+            LLVMBuildStore(comp_ctx->builder, depth, depth_ptr);
+        }
+    }
     return true;
 }
 
@@ -3935,6 +3994,9 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
                 return false;
         }
     }
+
+    if (!forge_instrument_call_depth(comp_ctx, func_ctx))
+        return false;
 
     /* Move func_return block to the bottom */
     if (func_ctx->func_return_block) {
