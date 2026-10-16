@@ -120,7 +120,8 @@ runtime_malloc(uint64 size, WASMModuleInstanceCommon *module_inst,
 
     if (size >= UINT32_MAX || !(mem = wasm_runtime_malloc((uint32)size))) {
         if (module_inst != NULL) {
-            wasm_runtime_set_exception(module_inst, "allocate memory failed");
+            wasm_set_exception_with_id((WASMModuleInstance *)module_inst,
+                                       EXCE_OUT_OF_MEMORY);
         }
         else if (error_buf != NULL) {
             set_error_buf(error_buf, error_buf_size, "allocate memory failed");
