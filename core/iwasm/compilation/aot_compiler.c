@@ -1019,6 +1019,18 @@ forge_instrument_call_depth(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
     if (!setter)
         setter = LLVMAddFunction(comp_ctx->module, "aot_set_exception_with_id", signature);
     LLVMPositionBuilderAtEnd(comp_ctx->builder, entry);
+    /* Keep static locals in the real entry block. Otherwise LLVM treats
+       them as dynamic allocas, disables promotion, and the stack-usage
+       report omits their additional native allocation. */
+    for (LLVMValueRef instruction = LLVMGetFirstInstruction(body), next;
+         instruction; instruction = next) {
+        next = LLVMGetNextInstruction(instruction);
+        if (LLVMIsAAllocaInst(instruction)
+            && LLVMIsAConstantInt(LLVMGetOperand(instruction, 0))) {
+            LLVMInstructionRemoveFromParent(instruction);
+            LLVMInsertIntoBuilder(comp_ctx->builder, instruction);
+        }
+    }
     offset = I32_CONST(offsetof(WASMExecEnv, forge_call_depth));
     depth_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "depth_ptr");
     offset = I32_CONST(offsetof(WASMExecEnv, forge_max_call_depth));

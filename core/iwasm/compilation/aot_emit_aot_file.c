@@ -3480,6 +3480,8 @@ read_stack_usage_file(const AOTCompContext *comp_ctx, const char *filename,
         char *colon;
         uintmax_t func_idx;
         uintmax_t sz;
+        char usage[16];
+        char trailing;
         int ret;
 
         if (cp == NULL) {
@@ -3505,8 +3507,10 @@ read_stack_usage_file(const AOTCompContext *comp_ctx, const char *filename,
             }
             prefix = aot_func_internal_prefix;
         }
-        ret = sscanf(fn + strlen(prefix), "%ju %ju static", &func_idx, &sz);
-        if (ret != 2) {
+        ret = sscanf(fn + strlen(prefix), "%ju %ju %15s %c", &func_idx,
+                     &sz, usage, &trailing);
+        if (ret != 3 || strcmp(usage, "static")) {
+            aot_set_last_error("unsupported native stack usage");
             goto fail;
         }
         if (sz > UINT32_MAX) {
