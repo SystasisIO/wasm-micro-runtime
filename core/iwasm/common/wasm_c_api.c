@@ -2283,7 +2283,12 @@ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
 
 #if WASM_ENABLE_WASM_CACHE != 0
     /* A binary-only cache key cannot preserve a caller's admission policy. */
-    if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD)
+    if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD || args->defer_jit
+        || args->load_budget.context || args->load_budget.begin_mapping
+        || args->load_budget.complete_mapping || args->load_budget.unmap
+        || args->load_budget.check || args->load_budget.before_protect
+        || args->load_budget.allocation_failed
+        || args->load_budget.protection_failed)
         goto quit;
     /* if cached */
     SHA256((void *)binary->data, binary->num_elems, (uint8_t *)binary_hash);

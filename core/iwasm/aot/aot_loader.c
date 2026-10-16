@@ -297,12 +297,16 @@ loader_malloc(uint64 size, char *error_buf, uint32 error_buf_size)
 }
 
 static void *
-loader_mmap(uint32 size, bool prot_exec, char *error_buf, uint32 error_buf_size)
+loader_mmap_unaccounted(uint32 size, bool prot_exec, int owned_flags, char *error_buf,
+                        uint32 error_buf_size)
 {
     int map_prot =
         MMAP_PROT_READ | MMAP_PROT_WRITE | (prot_exec ? MMAP_PROT_EXEC : 0);
     int map_flags;
     void *mem;
+
+    if (owned_flags & MMAP_MAP_NO_JIT)
+        map_prot &= ~MMAP_PROT_EXEC;
 
 #if defined(BUILD_TARGET_X86_64) || defined(BUILD_TARGET_AMD_64) \
     || defined(BUILD_TARGET_RISCV64_LP64D)                       \
@@ -315,7 +319,7 @@ loader_mmap(uint32 size, bool prot_exec, char *error_buf, uint32 error_buf_size)
        We try to mmap with MMAP_MAP_32BIT flag first, and if fails, mmap
        again without the flag. */
     /* sgx_tprotect_rsrv_mem() and sgx_alloc_rsrv_mem() will ignore flags */
-    map_flags = MMAP_MAP_32BIT;
+    map_flags = MMAP_MAP_32BIT | owned_flags;
     if ((mem = os_mmap(NULL, size, map_prot, map_flags,
                        os_get_invalid_handle()))) {
         /* Test whether the mmapped memory in the first 2 Gigabytes of the
@@ -329,13 +333,102 @@ loader_mmap(uint32 size, bool prot_exec, char *error_buf, uint32 error_buf_size)
 #endif
 #endif
 
-    map_flags = MMAP_MAP_NONE;
+    map_flags = owned_flags;
     if (!(mem = os_mmap(NULL, size, map_prot, map_flags,
                         os_get_invalid_handle()))) {
         set_error_buf(error_buf, error_buf_size, "allocate memory failed");
         return NULL;
     }
     return mem;
+}
+
+static void *
+loader_mmap(AOTModule *module, uint32 size, bool prot_exec, char *error_buf,
+            uint32 error_buf_size)
+{
+    WASMLoadBudget *budget = &module->load_budget;
+    size_t retained = 0, peak = 0;
+    int owned_flags = budget->begin_mapping ? MMAP_MAP_NO_HUGE : MMAP_MAP_NONE;
+    void *mem, *token = NULL;
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+    /* Darwin JIT text keeps the native per-thread W^X mechanism. Data must
+       never join a MAP_JIT extent, including default sections and padding. */
+    if (!prot_exec)
+        owned_flags |= MMAP_MAP_NO_JIT;
+#elif defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
+    owned_flags |= MMAP_MAP_NO_JIT;
+#endif
+    if (budget->begin_mapping) {
+#if defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
+        if (!os_mmap_sizes(size, MMAP_MAP_NO_HUGE, &retained, &peak)
+            || !(token = budget->begin_mapping(budget->context, retained, peak))) {
+            set_error_buf(error_buf, error_buf_size, "native mapping budget refused");
+            return NULL;
+        }
+#else
+        set_error_buf(error_buf, error_buf_size, "native mapping budget unsupported");
+        return NULL;
+#endif
+    }
+    /* No guest code runs before relocation and the checked final RX transition. */
+    mem = loader_mmap_unaccounted(size, prot_exec, owned_flags,
+                                 error_buf, error_buf_size);
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+    if (mem && prot_exec)
+        module->load_jit_code = true;
+#endif
+    if (!mem && budget->allocation_failed)
+        budget->allocation_failed(budget->context);
+    if (budget->begin_mapping)
+        budget->complete_mapping(budget->context, token, mem);
+    return mem;
+}
+
+static void
+loader_munmap(AOTModule *module, void *address, uint32 size)
+{
+    WASMLoadBudget *budget = &module->load_budget;
+    if (!address)
+        return;
+#if defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
+    if (budget->begin_mapping) {
+        size_t retained, peak;
+        if (os_mmap_sizes(size, MMAP_MAP_NO_HUGE, &retained, &peak))
+            budget->unmap(budget->context, address, retained);
+        return;
+    }
+#endif
+    os_munmap(address, size);
+}
+
+static bool
+loader_mprotect(AOTModule *module, void *address, uint32 size, int protection,
+                char *error_buf, uint32 error_buf_size)
+{
+    WASMLoadBudget *budget = &module->load_budget;
+    bool allowed = !budget->before_protect || budget->before_protect(budget->context);
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+    if (allowed && module->load_jit_code && (protection & MMAP_PROT_EXEC)) {
+        /* MAP_JIT VMA permissions are not effective per-thread permissions.
+           Do not apply mprotect to this extent or claim its RWX VMA is W^X. */
+        allowed = os_thread_jit_write_protect_supported();
+        if (allowed) {
+            os_thread_jit_write_protect_np(true);
+            return true;
+        }
+    }
+    else
+#endif
+    if (allowed)
+        allowed = os_mprotect(address, size, protection) == 0;
+    if (!allowed) {
+        module->load_protection_failed = true;
+        if (budget->protection_failed)
+            budget->protection_failed(budget->context);
+        set_error_buf(error_buf, error_buf_size, "native protection refused");
+        return false;
+    }
+    return true;
 }
 
 static char *
@@ -2531,7 +2624,7 @@ load_object_data_sections(const uint8 **p_buf, const uint8 *buf_end,
     if (total_size > 0) {
         /* Allocate memory for data */
         merged_sections = module->merged_data_sections =
-            loader_mmap((uint32)total_size, false, error_buf, error_buf_size);
+            loader_mmap(module, (uint32)total_size, false, error_buf, error_buf_size);
         if (!merged_sections) {
             return false;
         }
@@ -2656,6 +2749,10 @@ try_merge_data_and_text(const uint8 **buf, const uint8 **buf_end,
     uint64 total_size = 0;
     uint32 i;
     uint8 *sections;
+    int staging_protection = MMAP_PROT_READ | MMAP_PROT_WRITE;
+#if !defined(BH_PLATFORM_LINUX) && !defined(BH_PLATFORM_DARWIN)
+    staging_protection |= MMAP_PROT_EXEC;
+#endif
 
     if (code_size == 0) {
         return true;
@@ -2675,7 +2772,7 @@ try_merge_data_and_text(const uint8 **buf, const uint8 **buf_end,
     /* code_size was checked and must be larger than 0 here */
     bh_assert(total_size > 0);
 
-    sections = loader_mmap((uint32)total_size, false, NULL, 0);
+    sections = loader_mmap(module, (uint32)total_size, false, NULL, 0);
     if (!sections) {
         /* merge failed but may be not critical for some targets */
         return false;
@@ -2684,16 +2781,16 @@ try_merge_data_and_text(const uint8 **buf, const uint8 **buf_end,
 #ifdef BH_PLATFORM_WINDOWS
     if (!os_mem_commit(sections, code_size,
                        MMAP_PROT_READ | MMAP_PROT_WRITE | MMAP_PROT_EXEC)) {
-        os_munmap(sections, (uint32)total_size);
+        loader_munmap(module, sections, (uint32)total_size);
         return false;
     }
 #endif
 
-    /* change the code part to be executable */
-    if (os_mprotect(sections, code_size,
-                    MMAP_PROT_READ | MMAP_PROT_WRITE | MMAP_PROT_EXEC)
-        != 0) {
-        os_munmap(sections, (uint32)total_size);
+    /* POSIX offline text stays writable, not executable, until relocation ends. */
+    if (!loader_mprotect(module, sections, (uint32)code_size,
+                         staging_protection,
+                         error_buf, error_buf_size)) {
+        loader_munmap(module, sections, (uint32)total_size);
         return false;
     }
 
@@ -2704,7 +2801,7 @@ try_merge_data_and_text(const uint8 **buf, const uint8 **buf_end,
     *buf = sections;
     *buf_end = sections + code_size;
     bh_memcpy_s(sections, (uint32)code_size, old_buf, (uint32)code_size);
-    os_munmap(old_buf, code_size);
+    loader_munmap(module, old_buf, (uint32)code_size);
     sections += align_uint((uint32)code_size, page_size);
 
     /* then migrate .data sections */
@@ -2718,7 +2815,7 @@ try_merge_data_and_text(const uint8 **buf, const uint8 **buf_end,
     }
     /* free the original data sections */
     if (module->merged_data_sections) {
-        os_munmap(module->merged_data_sections,
+        loader_munmap(module, module->merged_data_sections,
                   module->merged_data_sections_size);
         module->merged_data_sections = NULL;
         module->merged_data_sections_size = 0;
@@ -3677,7 +3774,7 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
     if (size > 0) {
         if (size > UINT32_MAX
             || !(module->extra_plt_data = loader_mmap(
-                     (uint32)size, true, error_buf, error_buf_size))) {
+                     module, (uint32)size, true, error_buf, error_buf_size))) {
             goto fail;
         }
         module->extra_plt_data_size = (uint32)size;
@@ -3796,7 +3893,7 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
         size = (uint64)sizeof(void *) * got_item_count;
         if (size > UINT32_MAX
             || !(module->got_func_ptrs = loader_mmap(
-                     (uint32)size, false, error_buf, error_buf_size))) {
+                     module, (uint32)size, false, error_buf, error_buf_size))) {
             goto fail;
         }
 
@@ -3924,15 +4021,40 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
         uint8 *mmap_addr = module->literal - sizeof(uint32);
         uint32 total_size =
             sizeof(uint32) + module->literal_size + module->code_size;
-        os_mprotect(mmap_addr, total_size, map_prot);
+        if (!loader_mprotect(module, mmap_addr, total_size, map_prot,
+                             error_buf, error_buf_size))
+            goto fail;
     }
 
     map_prot = MMAP_PROT_READ;
 
+    /* Explicitly remove execute permission from every data page and padding,
+       not just the named read-only sections below. */
+    if (module->merged_data_text_sections) {
+        uint32 text_bytes = align_uint(sizeof(uint32) + module->literal_size
+                                          + module->code_size,
+                                      os_getpagesize());
+        if (module->merged_data_text_sections_size > text_bytes
+            && !loader_mprotect(module,
+                                module->merged_data_text_sections + text_bytes,
+                                module->merged_data_text_sections_size - text_bytes,
+                                MMAP_PROT_READ | MMAP_PROT_WRITE,
+                                error_buf, error_buf_size))
+            goto fail;
+    }
+    else if (module->merged_data_sections && module->merged_data_sections_size
+             && !loader_mprotect(module, module->merged_data_sections,
+                                 module->merged_data_sections_size,
+                                 MMAP_PROT_READ | MMAP_PROT_WRITE,
+                                 error_buf, error_buf_size))
+        goto fail;
+
 #if defined(BH_PLATFORM_WINDOWS)
     if (module->extra_plt_data) {
-        os_mprotect(module->extra_plt_data, module->extra_plt_data_size,
-                    map_prot);
+        if (!loader_mprotect(module, module->extra_plt_data,
+                             module->extra_plt_data_size, map_prot,
+                             error_buf, error_buf_size))
+            goto fail;
     }
 #endif
 
@@ -3946,7 +4068,9 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
             /* ".rodata.strn.m" */
             || !strncmp(data_section->name, ".rodata.str",
                         strlen(".rodata.str"))) {
-            os_mprotect(data_section->data, data_section->size, map_prot);
+            if (!loader_mprotect(module, data_section->data, data_section->size,
+                                 map_prot, error_buf, error_buf_size))
+                goto fail;
         }
     }
 
@@ -4022,16 +4146,21 @@ load_from_sections(AOTModule *module, AOTSection *sections,
                     return false;
                 break;
             case AOT_SECTION_TYPE_TEXT:
-#if !defined(BH_PLATFORM_NUTTX) && !defined(BH_PLATFORM_ESP_IDF)
+#if !defined(BH_PLATFORM_NUTTX) && !defined(BH_PLATFORM_ESP_IDF) \
+    && !(defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64))
                 /* try to merge .data and .text, with exceptions:
                  * 1. XIP mode
                  * 2. pre-mmapped module load from aot_load_from_sections()
                  * 3. nuttx & esp-idf: have separate region for MMAP_PROT_EXEC
+                 * 4. Darwin arm64: JIT text and non-executable data need
+                 *    different mapping/protection mechanisms
                  */
                 if (!module->is_indirect_mode && is_load_from_file_buf)
                     if (!try_merge_data_and_text(&buf, &buf_end, module,
                                                  error_buf, error_buf_size))
                         LOG_WARNING("merge .data and .text sections failed");
+                if (module->load_protection_failed)
+                    return false;
 #endif /* ! defined(BH_PLATFORM_NUTTX) && !defined(BH_PLATFORM_ESP_IDF) */
                 if (!load_text_section(buf, buf_end, module, error_buf,
                                        error_buf_size))
@@ -4256,14 +4385,14 @@ aot_load_from_sections(AOTSection *section_list, char *error_buf,
 }
 
 static void
-destroy_sections(AOTSection *section_list, bool destroy_aot_text)
+destroy_sections(AOTModule *module, AOTSection *section_list, bool destroy_aot_text)
 {
     AOTSection *section = section_list, *next;
     while (section) {
         next = section->next;
         if (destroy_aot_text && section->section_type == AOT_SECTION_TYPE_TEXT
             && section->section_body)
-            os_munmap((uint8 *)section->section_body,
+            loader_munmap(module, (uint8 *)section->section_body,
                       section->section_body_size);
         wasm_runtime_free(section);
         section = next;
@@ -4358,7 +4487,7 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                     total_size = (total_size + 3) & ~((uint64)3);
                     if (total_size >= UINT32_MAX
                         || !(aot_text =
-                                 loader_mmap((uint32)total_size, true,
+                                 loader_mmap(module, (uint32)total_size, true,
                                              error_buf, error_buf_size))) {
                         wasm_runtime_free(section);
                         goto fail;
@@ -4409,7 +4538,7 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
     return true;
 fail:
     if (section_list)
-        destroy_sections(section_list, destroy_aot_text);
+        destroy_sections(module, section_list, destroy_aot_text);
     return false;
 }
 
@@ -4457,7 +4586,7 @@ load(const uint8 *buf, uint32 size, AOTModule *module,
     if (!ret) {
         /* If load_from_sections() fails, then aot text is destroyed
            in destroy_sections() */
-        destroy_sections(section_list,
+        destroy_sections(module, section_list,
                          module->is_indirect_mode
                                  || module->merged_data_text_sections
                              ? false
@@ -4468,7 +4597,7 @@ load(const uint8 *buf, uint32 size, AOTModule *module,
     else {
         /* If load_from_sections() succeeds, then aot text is set to
            module->code and will be destroyed in aot_unload() */
-        destroy_sections(section_list, false);
+        destroy_sections(module, section_list, false);
     }
 
 #if 0
@@ -4496,17 +4625,33 @@ aot_load_from_aot_file(const uint8 *buf, uint32 size, const LoadArgs *args,
                        char *error_buf, uint32 error_buf_size)
 {
     AOTModule *module = create_module(args->name, error_buf, error_buf_size);
+#if defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
+    bool prior_jit_protection = os_thread_jit_write_protect_state();
+#else
+    bool prior_jit_protection = true;
+#endif
 
     if (!module)
         return NULL;
 
-    os_thread_jit_write_protect_np(false); /* Make memory writable */
-    if (!load(buf, size, module, args->wasm_binary_freeable, args->no_resolve,
-              error_buf, error_buf_size)) {
+    module->load_budget = args->load_budget;
+    if (!!module->load_budget.begin_mapping != !!module->load_budget.complete_mapping
+        || !!module->load_budget.begin_mapping != !!module->load_budget.unmap) {
+        set_error_buf(error_buf, error_buf_size, "incomplete native load budget");
         aot_unload(module);
         return NULL;
     }
-    os_thread_jit_write_protect_np(true); /* Make memory executable */
+    os_thread_jit_write_protect_np(false); /* Make memory writable */
+    if (!load(buf, size, module, args->wasm_binary_freeable, args->no_resolve,
+              error_buf, error_buf_size)
+        || module->load_protection_failed
+        || (module->load_budget.check
+            && !module->load_budget.check(module->load_budget.context))) {
+        aot_unload(module);
+        os_thread_jit_write_protect_np(prior_jit_protection);
+        return NULL;
+    }
+    os_thread_jit_write_protect_np(prior_jit_protection);
     os_icache_flush(module->code, module->code_size);
 
 #if WASM_ENABLE_AOT_VALIDATOR != 0
@@ -4624,12 +4769,12 @@ aot_unload(AOTModule *module)
         uint8 *mmap_addr = module->literal - sizeof(uint32);
         uint32 total_size =
             sizeof(uint32) + module->literal_size + module->code_size;
-        os_munmap(mmap_addr, total_size);
+        loader_munmap(module, mmap_addr, total_size);
     }
 
 #if defined(BH_PLATFORM_WINDOWS)
     if (module->extra_plt_data) {
-        os_munmap(module->extra_plt_data, module->extra_plt_data_size);
+        loader_munmap(module, module->extra_plt_data, module->extra_plt_data_size);
     }
 #endif
 
@@ -4639,7 +4784,7 @@ aot_unload(AOTModule *module)
         GOTItem *got_item = module->got_item_list, *got_item_next;
 
         if (module->got_func_ptrs) {
-            os_munmap(module->got_func_ptrs,
+            loader_munmap(module, module->got_func_ptrs,
                       sizeof(void *) * module->got_item_count);
         }
         while (got_item) {
@@ -4655,11 +4800,11 @@ aot_unload(AOTModule *module)
                                      module->data_section_count);
 
     if (module->merged_data_sections)
-        os_munmap(module->merged_data_sections,
+        loader_munmap(module, module->merged_data_sections,
                   module->merged_data_sections_size);
 
     if (module->merged_data_text_sections)
-        os_munmap(module->merged_data_text_sections,
+        loader_munmap(module, module->merged_data_text_sections,
                   module->merged_data_text_sections_size);
 
 #if WASM_ENABLE_DEBUG_AOT != 0

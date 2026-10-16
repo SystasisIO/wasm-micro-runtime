@@ -2289,6 +2289,30 @@ set_running_mode(WASMModuleInstance *module_inst, RunningMode running_mode,
     if (!wasm_runtime_is_running_mode_supported(running_mode))
         return false;
 
+    /* A deferred load has bytecode but no native entry table. Refuse before
+       changing mode, copying pointers, or waiting for workers that do not
+       exist. The ordinary lazy/tiered path still owns its initialized tables. */
+#if WASM_ENABLE_FAST_JIT != 0
+    if ((running_mode == Mode_Fast_JIT || running_mode == Mode_Multi_Tier_JIT)
+        && module->function_count && !module->fast_jit_func_ptrs)
+        return false;
+#endif
+#if WASM_ENABLE_JIT != 0
+    if ((running_mode == Mode_LLVM_JIT || running_mode == Mode_Multi_Tier_JIT)
+        && module->function_count
+        && (!module->func_ptrs || !module->comp_ctx || !module->comp_data))
+        return false;
+#if !(WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_LAZY_JIT != 0)
+    if (running_mode == Mode_LLVM_JIT) {
+        uint32 i;
+        for (i = 0; i < module->function_count; i++) {
+            if (!module->func_ptrs[i])
+                return false;
+        }
+    }
+#endif
+#endif
+
 #if !(WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_JIT != 0 \
       && WASM_ENABLE_LAZY_JIT != 0) /* No possible multi-tier JIT */
     (void)first_time_set;

@@ -349,6 +349,10 @@ typedef struct AOTModule {
     /* Whether the underlying wasm binary buffer can be freed */
     bool is_binary_freeable;
 
+    WASMLoadBudget load_budget;
+    bool load_protection_failed;
+    bool load_jit_code;
+
     /* `.data` sections merged into one mmaped to reduce the tlb cache miss */
     uint8 *merged_data_sections;
     uint32 merged_data_sections_size;

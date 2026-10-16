@@ -267,6 +267,19 @@ typedef enum WASMBlockTypeMode {
     WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO = 2
 } WASMBlockTypeMode;
 
+/* Optional per-load accounting. Context must outlive the loaded module.
+   A zero-initialized record preserves the ordinary upstream load path. */
+typedef struct WASMLoadBudget {
+    void *context;
+    void *(*begin_mapping)(void *context, uint64_t retained, uint64_t peak);
+    void (*complete_mapping)(void *context, void *token, void *address);
+    bool (*unmap)(void *context, void *address, uint64_t retained);
+    bool (*check)(void *context);
+    bool (*before_protect)(void *context);
+    void (*allocation_failed)(void *context);
+    void (*protection_failed)(void *context);
+} WASMLoadBudget;
+
 typedef struct LoadArgs {
     char *name;
     /* This option is only used by the Wasm C API (see wasm_c_api.h) */
@@ -285,6 +298,10 @@ typedef struct LoadArgs {
        profiles admit only one-byte numeric/void block types; the legacy mode
        additionally normalizes a literal zero byte to void in the owned input. */
     WASMBlockTypeMode block_type_mode;
+    WASMLoadBudget load_budget;
+    /* Keep upstream automatic JIT preparation by default. Explicit preparation
+       callers load only bytecode metadata, then compile after admission. */
+    bool defer_jit;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */

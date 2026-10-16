@@ -6052,6 +6052,21 @@ init_llvm_jit_functions_stage2(WASMModule *module, char *error_buf,
 
     return true;
 }
+
+static void
+destroy_llvm_jit_functions(WASMModule *module)
+{
+    if (module->func_ptrs)
+        wasm_runtime_free(module->func_ptrs);
+    if (module->comp_ctx)
+        aot_destroy_comp_context(module->comp_ctx);
+    if (module->comp_data)
+        aot_destroy_comp_data(module->comp_data);
+    module->func_ptrs = NULL;
+    module->func_ptrs_compiled = NULL;
+    module->comp_ctx = NULL;
+    module->comp_data = NULL;
+}
 #endif /* end of WASM_ENABLE_JIT != 0 */
 
 #if WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_JIT != 0 \
@@ -6310,6 +6325,16 @@ compile_jit_functions(WASMModule *module, char *error_buf,
 }
 #endif /* end of WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0 */
 
+bool
+wasm_loader_compile_llvm_jit(WASMModule *module, char *error_buf,
+                             uint32 error_buf_size)
+{
+    (void)module;
+    set_error_buf(error_buf, error_buf_size,
+                  "explicit bounded LLVM JIT is not available in this source profile");
+    return false;
+}
+
 static bool
 wasm_loader_prepare_bytecode(WASMModule *module, WASMFunction *func,
                              uint32 cur_func_idx, char *error_buf,
@@ -6325,7 +6350,8 @@ static void **handle_table;
 static bool
 load_from_sections(WASMModule *module, WASMSection *sections,
                    bool is_load_from_file_buf, bool wasm_binary_freeable,
-                   bool no_resolve, char *error_buf, uint32 error_buf_size)
+                   bool no_resolve, bool defer_jit, char *error_buf,
+                   uint32 error_buf_size)
 {
     WASMExport *export;
     WASMSection *section = sections;
@@ -6796,41 +6822,51 @@ load_from_sections(WASMModule *module, WASMSection *sections,
 
     calculate_global_data_offset(module);
 
+#if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0
+    /* Admission-only loads must not create compiler state, executable mappings
+       or compiler workers. The zero-default load option keeps upstream JIT
+       initialization unchanged for other callers. */
+    if (!defer_jit) {
+#endif
 #if WASM_ENABLE_FAST_JIT != 0
-    if (!init_fast_jit_functions(module, error_buf, error_buf_size)) {
-        return false;
-    }
+        if (!init_fast_jit_functions(module, error_buf, error_buf_size)) {
+            return false;
+        }
 #endif
 
 #if WASM_ENABLE_JIT != 0
-    if (!init_llvm_jit_functions_stage1(module, error_buf, error_buf_size)) {
-        return false;
-    }
+        if (!init_llvm_jit_functions_stage1(module, error_buf,
+                                           error_buf_size)) {
+            return false;
+        }
 #if !(WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_LAZY_JIT != 0)
-    if (!init_llvm_jit_functions_stage2(module, error_buf, error_buf_size)) {
-        return false;
-    }
+        if (!init_llvm_jit_functions_stage2(module, error_buf, error_buf_size)) {
+            return false;
+        }
 #else
-    /* Run aot_compile_wasm in a backend thread, so as not to block the main
-       thread fast jit execution, since applying llvm optimizations in
-       aot_compile_wasm may cost a lot of time.
-       Create thread with enough native stack to apply llvm optimizations */
-    if (os_thread_create(&module->llvm_jit_init_thread,
-                         init_llvm_jit_functions_stage2_callback,
-                         (void *)module, APP_THREAD_STACK_SIZE_DEFAULT * 8)
-        != 0) {
-        set_error_buf(error_buf, error_buf_size,
-                      "create orcjit compile thread failed");
-        return false;
-    }
+        /* Run aot_compile_wasm in a backend thread, so as not to block the main
+           thread fast jit execution, since applying llvm optimizations in
+           aot_compile_wasm may cost a lot of time.
+           Create thread with enough native stack to apply llvm optimizations */
+        if (os_thread_create(&module->llvm_jit_init_thread,
+                             init_llvm_jit_functions_stage2_callback,
+                             (void *)module, APP_THREAD_STACK_SIZE_DEFAULT * 8)
+            != 0) {
+            set_error_buf(error_buf, error_buf_size,
+                          "create orcjit compile thread failed");
+            return false;
+        }
 #endif
 #endif
 
 #if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0
-    /* Create threads to compile the jit functions */
-    if (!compile_jit_functions(module, error_buf, error_buf_size)) {
-        return false;
+        /* Create threads to compile the jit functions */
+        if (!compile_jit_functions(module, error_buf, error_buf_size)) {
+            return false;
+        }
     }
+#else
+    (void)defer_jit;
 #endif
 
 #if WASM_ENABLE_MEMORY_TRACING != 0
@@ -6944,8 +6980,8 @@ wasm_loader_load_from_sections(WASMSection *section_list, char *error_buf,
     if (!module)
         return NULL;
 
-    if (!load_from_sections(module, section_list, false, true, false, error_buf,
-                            error_buf_size)) {
+    if (!load_from_sections(module, section_list, false, true, false, false,
+                            error_buf, error_buf_size)) {
         wasm_loader_unload(module);
         return NULL;
     }
@@ -7089,7 +7125,7 @@ static union {
 
 static bool
 load(const uint8 *buf, uint32 size, WASMModule *module,
-     bool wasm_binary_freeable, bool no_resolve, char *error_buf,
+     bool wasm_binary_freeable, bool no_resolve, bool defer_jit, char *error_buf,
      uint32 error_buf_size)
 {
     const uint8 *buf_end = buf + size;
@@ -7121,7 +7157,8 @@ load(const uint8 *buf, uint32 size, WASMModule *module,
 
     if (!create_sections(buf, size, &section_list, error_buf, error_buf_size)
         || !load_from_sections(module, section_list, true, wasm_binary_freeable,
-                               no_resolve, error_buf, error_buf_size)) {
+                               no_resolve, defer_jit, error_buf,
+                               error_buf_size)) {
         destroy_sections(section_list);
         return false;
     }
@@ -7287,6 +7324,10 @@ wasm_loader_load(uint8 *buf, uint32 size,
                  const LoadArgs *args, char *error_buf, uint32 error_buf_size)
 {
     WASMModule *module;
+    bool defer_jit = false;
+#if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0
+    defer_jit = args->defer_jit;
+#endif
     if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD
         && args->block_type_mode != WASM_BLOCK_TYPES_NUMERIC
         && args->block_type_mode != WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO) {
@@ -7306,7 +7347,7 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
 
     if (!load(buf, size, module, args->wasm_binary_freeable, args->no_resolve,
-              error_buf, error_buf_size)) {
+              defer_jit, error_buf, error_buf_size)) {
         goto fail;
     }
 
@@ -7351,12 +7392,7 @@ wasm_loader_unload(WASMModule *module)
 #endif
 
 #if WASM_ENABLE_JIT != 0
-    if (module->func_ptrs)
-        wasm_runtime_free(module->func_ptrs);
-    if (module->comp_ctx)
-        aot_destroy_comp_context(module->comp_ctx);
-    if (module->comp_data)
-        aot_destroy_comp_data(module->comp_data);
+    destroy_llvm_jit_functions(module);
 #endif
 
 #if WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_JIT != 0 \

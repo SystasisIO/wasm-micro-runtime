@@ -30,6 +30,13 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
                  const LoadArgs *args, char *error_buf, uint32 error_buf_size);
 
+/* Reserved explicit prepublication preparation hook. This source profile
+   refuses it without changing module state; the bounded synchronous ORC
+   implementation is not enabled by the admission-only load option. */
+bool
+wasm_loader_compile_llvm_jit(WASMModule *module, char *error_buf,
+                             uint32 error_buf_size);
+
 /**
  * Load a WASM module from a specified WASM section list.
  *
