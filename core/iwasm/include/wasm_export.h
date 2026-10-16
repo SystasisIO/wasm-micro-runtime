@@ -1358,6 +1358,26 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_exception(wasm_module_inst_t module_inst,
                            const char *exception);
 
+typedef enum WASMExceptionStatus {
+    WASM_EXCEPTION_NONE = 0,
+    WASM_EXCEPTION_UNKNOWN = 1,
+    WASM_EXCEPTION_KNOWN = 2
+} WASMExceptionStatus;
+
+typedef struct WASMExceptionInfo {
+    WASMExceptionStatus status;
+    uint32_t id;
+} WASMExceptionInfo;
+
+/**
+ * Return a synchronized snapshot of the current exception classification.
+ * id is meaningful only for KNOWN and retains the engine's exception ID.
+ * Text-only exceptions are UNKNOWN, including text identical to engine traps.
+ * A fresh instance or a cleared exception is NONE.
+ */
+WASM_RUNTIME_API_EXTERN WASMExceptionInfo
+wasm_runtime_get_exception_info(wasm_module_inst_t module_inst);
+
 /**
  * Clear exception info of the WASM module instance.
  *

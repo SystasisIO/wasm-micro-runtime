@@ -146,7 +146,8 @@ execute_main(WASMModuleInstanceCommon *module_inst, int32 argc, char *argv[])
         /* report wasm proc exit as a success */
         WASMModuleInstance *inst = (WASMModuleInstance *)module_inst;
         if (!ret && strstr(inst->cur_exception, wasi_proc_exit_exception)) {
-            inst->cur_exception[0] = 0;
+            WASMExceptionInfo info = { WASM_EXCEPTION_NONE, 0 };
+            wasm_set_exception_local(inst, NULL, info);
             ret = true;
         }
         return ret;

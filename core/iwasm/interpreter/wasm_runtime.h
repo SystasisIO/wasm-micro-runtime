@@ -338,6 +338,7 @@ typedef struct WASMModuleInstanceExtraCommon {
 #if WASM_ENABLE_THREAD_MGR != 0
     korp_mutex exception_lock;
 #endif
+    WASMExceptionInfo exception_info;
 } WASMModuleInstanceExtraCommon;
 
 bool
@@ -611,6 +612,17 @@ wasm_set_exception(WASMModuleInstance *module, const char *exception);
 
 void
 wasm_set_exception_with_id(WASMModuleInstance *module_inst, uint32 id);
+
+/* Preserve a call site's diagnostic while supplying its actual engine ID. */
+void
+wasm_set_exception_with_id_and_message(WASMModuleInstance *module_inst,
+                                      uint32 id, const char *exception);
+
+/* Internal forwarding only: exception is already formatted. Does not acquire
+   a cluster lock; writes the message and classification under one local lock. */
+void
+wasm_set_exception_local(WASMModuleInstance *module_inst,
+                         const char *exception, WASMExceptionInfo info);
 
 const char *
 wasm_get_exception(WASMModuleInstance *module);

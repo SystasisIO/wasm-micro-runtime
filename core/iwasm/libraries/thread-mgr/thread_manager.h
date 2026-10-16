@@ -151,7 +151,8 @@ WASMExecEnv *
 wasm_clusters_search_exec_env(WASMModuleInstanceCommon *module_inst);
 
 void
-wasm_cluster_set_exception(WASMExecEnv *exec_env, const char *exception);
+wasm_cluster_set_exception(WASMExecEnv *exec_env, const char *exception,
+                           WASMExceptionInfo info);
 
 WASMExecEnv *
 wasm_cluster_spawn_exec_env(WASMExecEnv *exec_env);

@@ -248,7 +248,7 @@ runtime_signal_handler(void *sig_addr)
 #endif
 
         if (is_sig_addr_in_guard_pages(sig_addr, module_inst)) {
-            wasm_set_exception(module_inst, "out of bounds memory access");
+            wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
             os_longjmp(jmpbuf_node->jmpbuf, 1);
         }
 #if WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
@@ -257,7 +257,7 @@ runtime_signal_handler(void *sig_addr)
                         < stack_min_addr + page_size * guard_page_count) {
             /* The address which causes segmentation fault is inside
                native thread's guard page */
-            wasm_set_exception(module_inst, "native stack overflow");
+            wasm_set_exception_with_id(module_inst, EXCE_NATIVE_STACK_OVERFLOW);
             os_longjmp(jmpbuf_node->jmpbuf, 1);
         }
 #endif
@@ -375,7 +375,7 @@ runtime_exception_handler(EXCEPTION_POINTERS *exce_info)
                    Set exception and let the wasm func continue to run, when
                    the wasm func returns, the caller will check whether the
                    exception is thrown and return to runtime. */
-                wasm_set_exception(module_inst, "out of bounds memory access");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
                 ret = next_action(module_inst, exce_info);
                 if (ret == EXCEPTION_CONTINUE_SEARCH
                     || ret == EXCEPTION_CONTINUE_EXECUTION)
@@ -397,7 +397,7 @@ runtime_exception_handler(EXCEPTION_POINTERS *exce_info)
                to run, when the wasm func returns, the caller will check
                whether the exception is thrown and return to runtime, and
                the damaged stack will be recovered by _resetstkoflw(). */
-            wasm_set_exception(module_inst, "native stack overflow");
+            wasm_set_exception_with_id(module_inst, EXCE_NATIVE_STACK_OVERFLOW);
             ret = next_action(module_inst, exce_info);
             if (ret == EXCEPTION_CONTINUE_SEARCH
                 || ret == EXCEPTION_CONTINUE_EXECUTION)
@@ -3272,35 +3272,54 @@ wasm_runtime_get_exec_env_singleton(WASMModuleInstanceCommon *module_inst_comm)
     return module_inst->exec_env_singleton;
 }
 
-static void
-wasm_set_exception_local(WASMModuleInstance *module_inst, const char *exception)
+void
+wasm_set_exception_local(WASMModuleInstance *module_inst, const char *exception,
+                         WASMExceptionInfo info)
 {
     exception_lock(module_inst);
     if (exception) {
         snprintf(module_inst->cur_exception, sizeof(module_inst->cur_exception),
-                 "Exception: %s", exception);
+                 "%s", exception);
     }
     else {
         module_inst->cur_exception[0] = '\0';
+        info.status = WASM_EXCEPTION_NONE;
+        info.id = 0;
     }
+    GetModuleInstanceExtraCommon(module_inst)->exception_info = info;
     exception_unlock(module_inst);
+}
+
+static void
+set_exception_with_info(WASMModuleInstance *module_inst, const char *exception,
+                        WASMExceptionInfo info)
+{
+    char formatted[EXCEPTION_BUF_LEN];
+    if (exception) {
+        snprintf(formatted, sizeof(formatted), "Exception: %s", exception);
+        exception = formatted;
+    }
+#if WASM_ENABLE_THREAD_MGR != 0
+    WASMExecEnv *exec_env =
+        wasm_clusters_search_exec_env((WASMModuleInstanceCommon *)module_inst);
+    if (exec_env) {
+        wasm_cluster_set_exception(exec_env, exception, info);
+    }
+    else {
+        wasm_set_exception_local(module_inst, exception, info);
+    }
+#else
+    wasm_set_exception_local(module_inst, exception, info);
+#endif
 }
 
 void
 wasm_set_exception(WASMModuleInstance *module_inst, const char *exception)
 {
-#if WASM_ENABLE_THREAD_MGR != 0
-    WASMExecEnv *exec_env =
-        wasm_clusters_search_exec_env((WASMModuleInstanceCommon *)module_inst);
-    if (exec_env) {
-        wasm_cluster_set_exception(exec_env, exception);
-    }
-    else {
-        wasm_set_exception_local(module_inst, exception);
-    }
-#else
-    wasm_set_exception_local(module_inst, exception);
-#endif
+    WASMExceptionInfo info = {
+        exception ? WASM_EXCEPTION_UNKNOWN : WASM_EXCEPTION_NONE, 0
+    };
+    set_exception_with_info(module_inst, exception, info);
 }
 
 /* clang-format off */
@@ -3347,10 +3366,23 @@ static const char *exception_msgs[] = {
 void
 wasm_set_exception_with_id(WASMModuleInstance *module_inst, uint32 id)
 {
-    if (id < EXCE_NUM)
-        wasm_set_exception(module_inst, exception_msgs[id]);
-    else
-        wasm_set_exception(module_inst, "unknown exception");
+    wasm_set_exception_with_id_and_message(
+        module_inst, id,
+        id < EXCE_NUM ? exception_msgs[id] : "unknown exception");
+}
+
+void
+wasm_set_exception_with_id_and_message(WASMModuleInstance *module_inst,
+                                      uint32 id, const char *exception)
+{
+    WASMExceptionInfo info = { WASM_EXCEPTION_UNKNOWN, 0 };
+    if (id == EXCE_ALREADY_THROWN)
+        return;
+    if (id < EXCE_NUM) {
+        info.status = WASM_EXCEPTION_KNOWN;
+        info.id = id;
+    }
+    set_exception_with_info(module_inst, exception, info);
 }
 
 const char *
@@ -3403,6 +3435,20 @@ wasm_runtime_get_exception(WASMModuleInstanceCommon *module_inst_comm)
     bh_assert(module_inst_comm->module_type == Wasm_Module_Bytecode
               || module_inst_comm->module_type == Wasm_Module_AoT);
     return wasm_get_exception(module_inst);
+}
+
+WASMExceptionInfo
+wasm_runtime_get_exception_info(WASMModuleInstanceCommon *module_inst_comm)
+{
+    WASMModuleInstance *module_inst = (WASMModuleInstance *)module_inst_comm;
+    WASMExceptionInfo info;
+
+    bh_assert(module_inst_comm->module_type == Wasm_Module_Bytecode
+              || module_inst_comm->module_type == Wasm_Module_AoT);
+    exception_lock(module_inst);
+    info = GetModuleInstanceExtraCommon(module_inst)->exception_info;
+    exception_unlock(module_inst);
+    return info;
 }
 
 bool

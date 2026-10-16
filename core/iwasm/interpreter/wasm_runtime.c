@@ -1727,7 +1727,7 @@ execute_post_instantiate_functions(WASMModuleInstance *module_inst,
             if (!(exec_env = exec_env_created = wasm_exec_env_create(
                       (WASMModuleInstanceCommon *)module_inst,
                       module_inst->default_wasm_stack_size))) {
-                wasm_set_exception(module_inst, "allocate memory failed");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
                 return false;
             }
         }
@@ -1859,7 +1859,7 @@ execute_malloc_function(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
             if (!(exec_env = exec_env_created = wasm_exec_env_create(
                       (WASMModuleInstanceCommon *)module_inst,
                       module_inst->default_wasm_stack_size))) {
-                wasm_set_exception(module_inst, "allocate memory failed");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
                 return false;
             }
         }
@@ -1949,7 +1949,7 @@ execute_free_function(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
             if (!(exec_env = exec_env_created = wasm_exec_env_create(
                       (WASMModuleInstanceCommon *)module_inst,
                       module_inst->default_wasm_stack_size))) {
-                wasm_set_exception(module_inst, "allocate memory failed");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
                 return false;
             }
         }
@@ -2140,16 +2140,17 @@ wasm_create_func_obj(WASMModuleInstance *module_inst, uint32 func_idx,
     WASMFuncObjectRef func_obj;
     WASMFuncType *func_type;
     uint32 type_idx;
+    char local_error[EXCEPTION_BUF_LEN];
 
     if (throw_exce) {
-        error_buf = module_inst->cur_exception;
-        error_buf_size = sizeof(module_inst->cur_exception);
+        error_buf = local_error;
+        error_buf_size = sizeof(local_error);
     }
 
     if (func_idx >= module->import_function_count + module->function_count) {
         set_error_buf_v(error_buf, error_buf_size, "unknown function %d",
                         func_idx);
-        return NULL;
+        goto fail;
     }
 
     if (func_idx < module->import_function_count) {
@@ -2167,16 +2168,23 @@ wasm_create_func_obj(WASMModuleInstance *module_inst, uint32 func_idx,
                                        module->rtt_types, module->type_count,
                                        &module->rtt_type_lock))) {
         set_error_buf(error_buf, error_buf_size, "create rtt object failed");
-        return NULL;
+        goto fail;
     }
 
     if (!(func_obj = wasm_func_obj_new_internal(
               module_inst->e->common.gc_heap_handle, rtt_type, func_idx))) {
         set_error_buf(error_buf, error_buf_size, "create func object failed");
-        return NULL;
+        goto fail;
     }
 
     return func_obj;
+
+fail:
+    if (throw_exce) {
+        WASMExceptionInfo info = { WASM_EXCEPTION_UNKNOWN, 0 };
+        wasm_set_exception_local(module_inst, local_error, info);
+    }
+    return NULL;
 }
 
 static bool
@@ -3909,7 +3917,7 @@ wasm_module_realloc_internal(WASMModuleInstance *module_inst,
             wasm_set_exception(module_inst, "app heap corrupted");
         }
         else {
-            wasm_set_exception(module_inst, "out of memory");
+            wasm_set_exception_with_id_and_message(module_inst, EXCE_OUT_OF_MEMORY, "out of memory");
         }
         return 0;
     }
@@ -4054,13 +4062,13 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
     }
 
     if (tbl_elem_idx >= table_inst->cur_size) {
-        wasm_set_exception(module_inst, "undefined element");
+        wasm_set_exception_with_id(module_inst, EXCE_UNDEFINED_ELEMENT);
         goto got_exception;
     }
 
     tbl_elem_val = ((table_elem_type_t *)table_inst->elems)[tbl_elem_idx];
     if (tbl_elem_val == NULL_REF) {
-        wasm_set_exception(module_inst, "uninitialized element");
+        wasm_set_exception_with_id(module_inst, EXCE_UNINITIALIZED_ELEMENT);
         goto got_exception;
     }
 
@@ -4075,7 +4083,7 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
      * we insist to call functions owned by the module itself
      **/
     if (func_idx >= module_inst->e->function_count) {
-        wasm_set_exception(module_inst, "unknown function");
+        wasm_set_exception_with_id_and_message(module_inst, EXCE_INVALID_FUNCTION_INDEX, "unknown function");
         goto got_exception;
     }
 
@@ -4091,7 +4099,7 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
             cur_func_type = (WASMType *)func_inst->u.func->func_type;
 
         if (cur_type != cur_func_type) {
-            wasm_set_exception(module_inst, "indirect call type mismatch");
+            wasm_set_exception_with_id(module_inst, EXCE_INVALID_FUNCTION_TYPE_INDEX);
             goto got_exception;
         }
     }
@@ -4742,7 +4750,7 @@ llvm_jit_memory_init(WASMModuleInstance *module_inst, uint32 seg_index,
         return false;
 
     if ((uint64)offset + (uint64)len > seg_len) {
-        wasm_set_exception(module_inst, "out of bounds memory access");
+        wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
         return false;
     }
 
@@ -5009,7 +5017,7 @@ llvm_array_init_with_data(WASMModuleInstance *module_inst, uint32 seg_index,
 
     if (data_seg_offset >= data_seg->data_length
         || total_size > data_seg->data_length - data_seg_offset) {
-        wasm_set_exception(module_inst, "out of bounds memory access");
+        wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
         return false;
     }
 
