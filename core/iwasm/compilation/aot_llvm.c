@@ -3440,6 +3440,10 @@ aot_create_comp_context(const AOTCompData *comp_data, aot_comp_option_t option)
     comp_ctx->pointer_size = LLVMPointerSize(target_data_ref);
     LLVMDisposeTargetData(target_data_ref);
 
+    /* Reject an unrepresentable instance layout before emitting i32 offsets. */
+    if (get_module_inst_extra_offset(comp_ctx) == UINT32_MAX)
+        goto fail;
+
     comp_ctx->optimize = true;
     if (option->output_format == AOT_LLVMIR_UNOPT_FILE)
         comp_ctx->optimize = false;

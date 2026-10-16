@@ -652,7 +652,7 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                 goto fail;
             }
 
-            total_size = offsetof(WASMTableInstance, elems);
+            total_size = wasm_table_instance_size(0, sizeof(table_elem_type_t));
         }
         else
 #endif
@@ -663,9 +663,9 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                                  : import->u.table.table_type.init_size;
 
             /* it is a built-in table, every module has its own */
-            total_size = offsetof(WASMTableInstance, elems);
             /* store function indexes for non-gc, object pointers for gc */
-            total_size += (uint64)sizeof(table_elem_type_t) * max_size_fixed;
+            total_size = wasm_table_instance_size(max_size_fixed,
+                                                  sizeof(table_elem_type_t));
         }
 
         tables[table_index++] = table;
@@ -712,7 +712,6 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     for (i = 0; i < module->table_count; i++) {
         uint32 max_size_fixed = 0;
 
-        total_size = offsetof(WASMTableInstance, elems);
 #if WASM_ENABLE_MULTI_MODULE != 0
         /* in case, a module which imports this table will grow it */
         max_size_fixed = module->tables[i].table_type.max_size;
@@ -721,13 +720,8 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                              ? module->tables[i].table_type.max_size
                              : module->tables[i].table_type.init_size;
 #endif
-#if WASM_ENABLE_GC == 0
-        /* Store function indexes */
-        total_size += sizeof(uintptr_t) * (uint64)max_size_fixed;
-#else
-        /* Store object pointers */
-        total_size += sizeof(uintptr_t) * (uint64)max_size_fixed;
-#endif
+        total_size = wasm_table_instance_size(max_size_fixed,
+                                              sizeof(table_elem_type_t));
 
         tables[table_index++] = table;
 
@@ -2456,7 +2450,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     uint32 module_inst_struct_size =
         offsetof(WASMModuleInstance, global_table_data.bytes);
     uint64 module_inst_mem_inst_size;
-    uint64 total_size, table_size = 0;
+    uint64 total_size, table_data_offset, table_size = 0;
     uint8 *global_data, *global_data_end;
 #if WASM_ENABLE_MULTI_MODULE != 0
     bool ret = false;
@@ -2486,40 +2480,52 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 #endif
 
     /* Size of module inst, memory instances and global data */
-    total_size = (uint64)module_inst_struct_size + module_inst_mem_inst_size
-                 + module->global_data_size;
+    table_data_offset = align_uint64((uint64)module_inst_struct_size
+                                        + module_inst_mem_inst_size
+                                        + module->global_data_size,
+                                    8);
 
     /* Calculate the size of table data */
     for (i = 0; i < module->import_table_count; i++) {
         WASMTableImport *import_table = &module->import_tables[i].u.table;
-        table_size += offsetof(WASMTableInstance, elems);
 #if WASM_ENABLE_MULTI_MODULE != 0
-        table_size += (uint64)sizeof(table_elem_type_t)
-                      * import_table->table_type.max_size;
+        table_size += wasm_table_instance_size(import_table->table_type.max_size,
+                                                sizeof(table_elem_type_t));
 #else
-        table_size += (uint64)sizeof(table_elem_type_t)
-                      * (import_table->table_type.possible_grow
-                             ? import_table->table_type.max_size
-                             : import_table->table_type.init_size);
+        table_size += wasm_table_instance_size(
+            import_table->table_type.possible_grow
+                ? import_table->table_type.max_size
+                : import_table->table_type.init_size,
+            sizeof(table_elem_type_t));
 #endif
+        if (table_size >= UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+            return NULL;
+        }
     }
     for (i = 0; i < module->table_count; i++) {
         WASMTable *table = module->tables + i;
-        table_size += offsetof(WASMTableInstance, elems);
 #if WASM_ENABLE_MULTI_MODULE != 0
-        table_size +=
-            (uint64)sizeof(table_elem_type_t) * table->table_type.max_size;
+        table_size += wasm_table_instance_size(table->table_type.max_size,
+                                                sizeof(table_elem_type_t));
 #else
-        table_size +=
-            (uint64)sizeof(table_elem_type_t)
-            * (table->table_type.possible_grow ? table->table_type.max_size
-                                               : table->table_type.init_size);
+        table_size += wasm_table_instance_size(
+            table->table_type.possible_grow ? table->table_type.max_size
+                                            : table->table_type.init_size,
+            sizeof(table_elem_type_t));
 #endif
+        if (table_size >= UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+            return NULL;
+        }
     }
-    total_size += table_size;
+    total_size = table_data_offset + table_size;
 
-    /* The offset of WASMModuleInstanceExtra, make it 8-byte aligned */
-    total_size = (total_size + 7LL) & ~7LL;
+    /* The table start and every table stride are already 8-byte aligned. */
+    if (total_size >= UINT32_MAX - sizeof(WASMModuleInstanceExtra)) {
+        set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+        return NULL;
+    }
     extra_info_offset = (uint32)total_size;
     total_size += sizeof(WASMModuleInstanceExtra);
 
@@ -2629,8 +2635,8 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     module_inst->global_data = (uint8 *)module_inst + module_inst_struct_size
                                + module_inst_mem_inst_size;
     module_inst->global_data_size = module->global_data_size;
-    first_table = (WASMTableInstance *)(module_inst->global_data
-                                        + module->global_data_size);
+    first_table = (WASMTableInstance *)((uint8 *)module_inst
+                                        + (uint32)table_data_offset);
 
     module_inst->memory_count =
         module->import_memory_count + module->memory_count;

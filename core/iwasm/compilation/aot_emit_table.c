@@ -97,13 +97,17 @@ get_tbl_inst_offset(const AOTCompContext *comp_ctx,
         + (comp_ctx->pointer_size == sizeof(uint64)
                ? comp_ctx->comp_data->global_data_size_64bit
                : comp_ctx->comp_data->global_data_size_32bit);
+    offset = align_uint64(offset, 8);
+    if (offset >= UINT32_MAX)
+        return UINT32_MAX;
 
     while (i < tbl_idx && i < comp_ctx->comp_data->import_table_count) {
-        offset += offsetof(AOTTableInstance, elems);
         /* avoid loading from current AOTTableInstance */
-        offset +=
-            (uint64)comp_ctx->pointer_size
-            * aot_get_imp_tbl_data_slots(imp_tbls + i, comp_ctx->is_jit_mode);
+        offset += wasm_table_instance_size(
+            aot_get_imp_tbl_data_slots(imp_tbls + i, comp_ctx->is_jit_mode),
+            comp_ctx->pointer_size);
+        if (offset >= UINT32_MAX)
+            return UINT32_MAX;
         ++i;
     }
 
@@ -114,10 +118,12 @@ get_tbl_inst_offset(const AOTCompContext *comp_ctx,
     tbl_idx -= comp_ctx->comp_data->import_table_count;
     i -= comp_ctx->comp_data->import_table_count;
     while (i < tbl_idx && i < comp_ctx->comp_data->table_count) {
-        offset += offsetof(AOTTableInstance, elems);
         /* avoid loading from current AOTTableInstance */
-        offset += (uint64)comp_ctx->pointer_size
-                  * aot_get_tbl_data_slots(tbls + i, comp_ctx->is_jit_mode);
+        offset += wasm_table_instance_size(
+            aot_get_tbl_data_slots(tbls + i, comp_ctx->is_jit_mode),
+            comp_ctx->pointer_size);
+        if (offset >= UINT32_MAX)
+            return UINT32_MAX;
         ++i;
     }
 
@@ -128,12 +134,27 @@ uint32
 get_module_inst_extra_offset(AOTCompContext *comp_ctx)
 {
     const AOTCompData *comp_data = comp_ctx->comp_data;
-    uint32 table_count = comp_data->import_table_count + comp_data->table_count;
-    uint64 offset = get_tbl_inst_offset(comp_ctx, NULL, table_count);
-    uint32 offset_32 = (uint32)offset;
-    bh_assert(offset <= UINT32_MAX);
-    offset_32 = align_uint(offset_32, 8);
-    return offset_32;
+    uint64 table_count = (uint64)comp_data->import_table_count
+                         + comp_data->table_count;
+    uint64 offset;
+    uint32 extra_size = comp_ctx->is_jit_mode ? sizeof(WASMModuleInstanceExtra)
+                                              : sizeof(AOTModuleInstanceExtra);
+    const uint64 signed_offset_limit = (uint64)INT32_MAX + 1;
+
+    /* GEP indices are emitted as i32 and sign-extended on 64-bit targets.
+       Keep every field inside the positive-offset representation. */
+
+    if (table_count >= UINT32_MAX)
+        goto fail;
+    offset = get_tbl_inst_offset(comp_ctx, NULL, (uint32)table_count);
+    if (extra_size >= signed_offset_limit
+        || offset >= signed_offset_limit - extra_size)
+        goto fail;
+    return (uint32)offset;
+
+fail:
+    aot_set_last_error("module instance exceeds signed offset limit");
+    return UINT32_MAX;
 }
 
 #if WASM_ENABLE_REF_TYPES != 0 || WASM_ENABLE_GC != 0

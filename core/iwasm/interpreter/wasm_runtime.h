@@ -191,6 +191,15 @@ struct WASMTableInstance {
     table_elem_type_t elems[1];
 };
 
+static inline uint64
+wasm_table_instance_size(uint32 elem_count, uint32 elem_size)
+{
+    /* elem_size is the target pointer width when used by the AOT compiler. */
+    return align_uint64(offsetof(WASMTableInstance, elems)
+                            + (uint64)elem_size * elem_count,
+                        8);
+}
+
 struct WASMGlobalInstance {
     /* value type, VALUE_TYPE_I32/I64/F32/F64 */
     uint8 type;

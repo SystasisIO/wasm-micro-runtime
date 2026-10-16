@@ -827,10 +827,10 @@ tables_instantiate(AOTModuleInstance *module_inst, AOTModule *module,
 #endif
 
         module_inst->tables[i] = tbl_inst;
-        tbl_inst = (AOTTableInstance *)((uint8 *)tbl_inst
-                                        + offsetof(AOTTableInstance, elems)
-                                        + sizeof(table_elem_type_t)
-                                              * tbl_inst->max_size);
+        tbl_inst = (AOTTableInstance *)(
+            (uint8 *)tbl_inst
+            + (uint32)wasm_table_instance_size(tbl_inst->max_size,
+                                               sizeof(table_elem_type_t)));
     }
 
     /* fill table with element segment content */
@@ -1930,7 +1930,7 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
         offsetof(AOTModuleInstance, global_table_data.bytes);
     const uint64 module_inst_mem_inst_size =
         (uint64)module->memory_count * sizeof(AOTMemoryInstance);
-    uint64 total_size, table_size = 0;
+    uint64 total_size, table_data_offset, table_size = 0;
     uint8 *p;
     uint32 i, extra_info_offset;
     const bool is_sub_inst = parent != NULL;
@@ -1946,29 +1946,40 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
     if (heap_size > APP_HEAP_SIZE_MAX)
         heap_size = APP_HEAP_SIZE_MAX;
 
-    total_size = (uint64)module_inst_struct_size + module_inst_mem_inst_size
-                 + module->global_data_size;
+    table_data_offset = align_uint64((uint64)module_inst_struct_size
+                                        + module_inst_mem_inst_size
+                                        + module->global_data_size,
+                                    8);
 
     /*
      * calculate size of table data
      */
     for (i = 0; i != module->import_table_count; ++i) {
-        table_size += offsetof(AOTTableInstance, elems);
-        table_size += (uint64)sizeof(table_elem_type_t)
-                      * (uint64)aot_get_imp_tbl_data_slots(
-                          module->import_tables + i, false);
+        table_size += wasm_table_instance_size(
+            aot_get_imp_tbl_data_slots(module->import_tables + i, false),
+            sizeof(table_elem_type_t));
+        if (table_size >= UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+            return NULL;
+        }
     }
 
     for (i = 0; i != module->table_count; ++i) {
-        table_size += offsetof(AOTTableInstance, elems);
-        table_size +=
-            (uint64)sizeof(table_elem_type_t)
-            * (uint64)aot_get_tbl_data_slots(module->tables + i, false);
+        table_size += wasm_table_instance_size(
+            aot_get_tbl_data_slots(module->tables + i, false),
+            sizeof(table_elem_type_t));
+        if (table_size >= UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+            return NULL;
+        }
     }
-    total_size += table_size;
+    total_size = table_data_offset + table_size;
 
-    /* The offset of AOTModuleInstanceExtra, make it 8-byte aligned */
-    total_size = (total_size + 7LL) & ~7LL;
+    /* The table start and every table stride are already 8-byte aligned. */
+    if (total_size >= UINT32_MAX - sizeof(AOTModuleInstanceExtra)) {
+        set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+        return NULL;
+    }
     extra_info_offset = (uint32)total_size;
     total_size += sizeof(AOTModuleInstanceExtra);
 
@@ -2086,7 +2097,7 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
         goto fail;
 
     /* Initialize table info */
-    p += module->global_data_size;
+    p = (uint8 *)module_inst + (uint32)table_data_offset;
     module_inst->table_count = module->table_count + module->import_table_count;
     if (!tables_instantiate(module_inst, module, (AOTTableInstance *)p,
                             error_buf, error_buf_size))
