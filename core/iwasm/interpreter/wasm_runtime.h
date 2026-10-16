@@ -314,6 +314,7 @@ typedef struct CApiFuncImport {
 
 /* The common part of WASMModuleInstanceExtra and AOTModuleInstanceExtra */
 typedef struct WASMModuleInstanceExtraCommon {
+    bool initialization_pending;
 #if WASM_ENABLE_MODULE_INST_CONTEXT != 0
     void *contexts[WASM_MAX_INSTANCE_CONTEXTS];
 #endif
@@ -338,6 +339,9 @@ typedef struct WASMModuleInstanceExtraCommon {
     korp_mutex exception_lock;
 #endif
 } WASMModuleInstanceExtraCommon;
+
+bool
+wasm_initialize(WASMModuleInstance *module_inst);
 
 /* Extra info of WASM module instance for interpreter/jit mode */
 typedef struct WASMModuleInstanceExtra {

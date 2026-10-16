@@ -562,6 +562,9 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
  * @param module_inst the AOT module instance to destroy
  * @param is_sub_inst the flag of sub instance
  */
+bool
+aot_initialize(AOTModuleInstance *module_inst);
+
 void
 aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst);
 

@@ -1787,6 +1787,31 @@ wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
     p->custom_data = custom_data;
 }
 
+void
+wasm_runtime_instantiation_args_set_defer_start(struct InstantiationArgs2 *p,
+                                               bool defer_start)
+{
+    p->defer_start = defer_start;
+}
+
+bool
+wasm_runtime_initialize(WASMModuleInstanceCommon *module_inst)
+{
+    WASMFPEnvironment env;
+    bool result = false;
+    if (!module_inst || !wasm_fp_enter(&env))
+        return false;
+#if WASM_ENABLE_INTERP != 0
+    if (module_inst->module_type == Wasm_Module_Bytecode)
+        result = wasm_initialize((WASMModuleInstance *)module_inst);
+#endif
+#if WASM_ENABLE_AOT != 0
+    if (module_inst->module_type == Wasm_Module_AoT)
+        result = aot_initialize((AOTModuleInstance *)module_inst);
+#endif
+    return wasm_fp_leave(&env) && result;
+}
+
 #if WASM_ENABLE_LIBC_WASI != 0
 void
 wasm_runtime_instantiation_args_set_wasi_arg(struct InstantiationArgs2 *p,

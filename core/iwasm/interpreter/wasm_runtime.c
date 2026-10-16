@@ -1780,6 +1780,17 @@ fail:
     return ret;
 }
 
+bool
+wasm_initialize(WASMModuleInstance *module_inst)
+{
+    if (!module_inst->e->common.initialization_pending) {
+        wasm_set_exception(module_inst, "initialization is not pending");
+        return false;
+    }
+    module_inst->e->common.initialization_pending = false;
+    return execute_post_instantiate_functions(module_inst, false, NULL);
+}
+
 static bool
 execute_malloc_function(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
                         WASMFunctionInstance *malloc_func,
@@ -3338,7 +3349,10 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                 &module_inst->e->functions[module->start_function];
     }
 
-    if (!execute_post_instantiate_functions(module_inst, is_sub_inst,
+    if (args->defer_start && !is_sub_inst) {
+        module_inst->e->common.initialization_pending = true;
+    }
+    else if (!execute_post_instantiate_functions(module_inst, is_sub_inst,
                                             exec_env_main)) {
         set_error_buf(error_buf, error_buf_size, module_inst->cur_exception);
         goto fail;

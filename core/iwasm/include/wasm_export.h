@@ -784,6 +784,16 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
                                                 void *custom_data);
 
+/* Defer guest initialization until wasm_runtime_initialize. The caller must
+ * initialize once before calling any guest export and exclusively own the
+ * instance throughout initialization. Failed initialization is not retryable. */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_defer_start(struct InstantiationArgs2 *p,
+                                               bool defer_start);
+
+WASM_RUNTIME_API_EXTERN bool
+wasm_runtime_initialize(wasm_module_inst_t module_inst);
+
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_wasi_arg(struct InstantiationArgs2 *p,
                                              char *argv[], int argc);

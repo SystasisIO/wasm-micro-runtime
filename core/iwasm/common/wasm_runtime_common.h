@@ -618,6 +618,7 @@ wasm_runtime_get_exec_env_tls(void);
 struct InstantiationArgs2 {
     InstantiationArgs v1;
     void *custom_data;
+    bool defer_start;
 #if WASM_ENABLE_LIBC_WASI != 0
     WASIArguments wasi;
 #endif
