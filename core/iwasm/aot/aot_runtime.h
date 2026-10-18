@@ -97,6 +97,7 @@ typedef struct AOTRelocationGroup {
 /* AOT function instance */
 typedef struct AOTFunctionInstance {
     char *func_name;
+    uint32 func_name_len;
     uint32 func_index;
     bool is_import_func;
     union {

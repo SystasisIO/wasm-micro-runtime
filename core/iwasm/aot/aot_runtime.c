@@ -1189,7 +1189,8 @@ aot_lookup_memory(AOTModuleInstance *module_inst, char const *name)
 #if WASM_ENABLE_MULTI_MEMORY != 0
     uint32 i;
     for (i = 0; i < module_inst->export_memory_count; i++)
-        if (!strcmp(module_inst->export_memories[i].name, name))
+        if (wasm_name_equals(module_inst->export_memories[i].name,
+                             module_inst->export_memories[i].name_len, name))
             return module_inst->export_memories[i].memory;
     return NULL;
 #else
@@ -1574,7 +1575,8 @@ cmp_func_inst(const void *a, const void *b)
     const AOTFunctionInstance *func_inst1 = (const AOTFunctionInstance *)a;
     const AOTFunctionInstance *func_inst2 = (const AOTFunctionInstance *)b;
 
-    return strcmp(func_inst1->func_name, func_inst2->func_name);
+    return wasm_name_compare(func_inst1->func_name, func_inst1->func_name_len,
+                             func_inst2->func_name, func_inst2->func_name_len);
 }
 
 static bool
@@ -1598,6 +1600,7 @@ create_export_funcs(AOTModuleInstance *module_inst, AOTModule *module,
         for (i = 0; i < module->export_count; i++) {
             if (exports[i].kind == EXPORT_KIND_FUNC) {
                 export_func->func_name = exports[i].name;
+                export_func->func_name_len = exports[i].name_len;
                 export_func->func_index = exports[i].index;
                 if (export_func->func_index < module->import_func_count) {
                     export_func->is_import_func = true;
@@ -1646,6 +1649,7 @@ export_memories_instantiate(const AOTModule *module,
     for (i = 0; i < module->export_count; i++, export ++)
         if (export->kind == EXPORT_KIND_MEMORY) {
             export_memory->name = export->name;
+            export_memory->name_len = export->name_len;
             export_memory->memory = module_inst->memories[export->index];
             export_memory++;
         }
@@ -2481,9 +2485,13 @@ aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst)
 AOTFunctionInstance *
 aot_lookup_function(const AOTModuleInstance *module_inst, const char *name)
 {
+    size_t name_len = strlen(name);
+    if (name_len > UINT32_MAX)
+        return NULL;
     AOTFunctionInstance *export_funcs =
         (AOTFunctionInstance *)module_inst->export_functions;
-    AOTFunctionInstance key = { .func_name = (char *)name };
+    AOTFunctionInstance key = { .func_name = (char *)name,
+                               .func_name_len = (uint32)name_len };
 
     if (!export_funcs)
         return NULL;
@@ -3785,6 +3793,8 @@ aot_get_module_mem_consumption(const AOTModule *module,
     mem_conspn->memories_size = sizeof(AOTMemory) * module->memory_count;
     mem_conspn->globals_size = sizeof(AOTGlobal) * module->global_count;
     mem_conspn->exports_size = sizeof(AOTExport) * module->export_count;
+    for (i = 0; i < module->export_count; i++)
+        mem_conspn->exports_size += module->exports[i].name_len + 1;
 
     mem_conspn->table_segs_size =
         sizeof(AOTTableInitData *) * module->table_init_data_count;

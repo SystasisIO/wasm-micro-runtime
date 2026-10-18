@@ -2760,8 +2760,8 @@ wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
         }
 
         /* byte* -> wasm_byte_vec_t */
-        wasm_name_new_from_string_nt(&name, export->name);
-        if (strlen(export->name) && !name.data) {
+        wasm_name_new(&name, export->name_len, export->name);
+        if (export->name_len && !name.data) {
             goto failed;
         }
 
@@ -4848,8 +4848,8 @@ aot_process_export(wasm_store_t *store, const AOTModuleInstance *inst_aot,
             goto failed;
         }
 
-        wasm_name_new_from_string_nt(external->name, export->name);
-        if (strlen(export->name) && !external->name->data) {
+        wasm_name_new(external->name, export->name_len, export->name);
+        if (export->name_len && !external->name->data) {
             goto failed;
         }
 

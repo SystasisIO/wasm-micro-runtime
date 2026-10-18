@@ -63,6 +63,71 @@
 #undef CHECK
 #undef CHECK1
 
+static bool
+check_utf8_str(const uint8 *str, uint32 len, bool allow_null)
+{
+    /* Unicode 9.0, section 3.9: reuse the existing runtime name validator. */
+    const uint8 *p = str, *p_end = str + len;
+    uint8 chr;
+
+    while (p < p_end) {
+        chr = *p;
+        if (chr == 0 && !allow_null)
+            return false;
+        else if (chr < 0x80)
+            p++;
+        else if (chr >= 0xC2 && chr <= 0xDF && p + 1 < p_end) {
+            if (p[1] < 0x80 || p[1] > 0xBF)
+                return false;
+            p += 2;
+        }
+        else if (chr >= 0xE0 && chr <= 0xEF && p + 2 < p_end) {
+            if (chr == 0xE0) {
+                if (p[1] < 0xA0 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF)
+                    return false;
+            }
+            else if (chr == 0xED) {
+                if (p[1] < 0x80 || p[1] > 0x9F || p[2] < 0x80 || p[2] > 0xBF)
+                    return false;
+            }
+            else if (p[1] < 0x80 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF)
+                return false;
+            p += 3;
+        }
+        else if (chr >= 0xF0 && chr <= 0xF4 && p + 3 < p_end) {
+            if (chr == 0xF0) {
+                if (p[1] < 0x90 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF
+                    || p[3] < 0x80 || p[3] > 0xBF)
+                    return false;
+            }
+            else if (chr <= 0xF3) {
+                if (p[1] < 0x80 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF
+                    || p[3] < 0x80 || p[3] > 0xBF)
+                    return false;
+            }
+            else if (p[1] < 0x80 || p[1] > 0x8F || p[2] < 0x80 || p[2] > 0xBF
+                     || p[3] < 0x80 || p[3] > 0xBF)
+                return false;
+            p += 4;
+        }
+        else
+            return false;
+    }
+    return p == p_end;
+}
+
+bool
+wasm_check_utf8_str(const uint8 *str, uint32 len)
+{
+    return check_utf8_str(str, len, false);
+}
+
+bool
+wasm_check_export_name(const uint8 *str, uint32 len)
+{
+    return check_utf8_str(str, len, true);
+}
+
 #if WASM_ENABLE_MULTI_MODULE != 0
 /**
  * A safety insurance to prevent
@@ -2337,7 +2402,7 @@ wasm_runtime_get_export_global_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < wasm_module->export_count; i++) {
             const WASMExport *wasm_export = &wasm_module->exports[i];
             if ((wasm_export->kind == WASM_IMPORT_EXPORT_KIND_GLOBAL)
-                && !strcmp(wasm_export->name, name)) {
+                && wasm_name_equals(wasm_export->name, wasm_export->name_len, name)) {
                 const WASMModuleInstanceExtra *e =
                     (WASMModuleInstanceExtra *)wasm_module_inst->e;
                 const WASMGlobalInstance *global =
@@ -2368,7 +2433,7 @@ wasm_runtime_get_export_global_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < aot_module->export_count; i++) {
             const AOTExport *aot_export = &aot_module->exports[i];
             if ((aot_export->kind == WASM_IMPORT_EXPORT_KIND_GLOBAL)
-                && !strcmp(aot_export->name, name)) {
+                && wasm_name_equals(aot_export->name, aot_export->name_len, name)) {
                 const AOTGlobal *global =
                     &aot_module->globals[aot_export->index];
                 global_inst->kind = val_type_to_val_kind(global->type.val_type);
@@ -2398,7 +2463,7 @@ wasm_runtime_get_export_table_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < wasm_module->export_count; i++) {
             const WASMExport *wasm_export = &wasm_module->exports[i];
             if ((wasm_export->kind == WASM_IMPORT_EXPORT_KIND_TABLE)
-                && !strcmp(wasm_export->name, name)) {
+                && wasm_name_equals(wasm_export->name, wasm_export->name_len, name)) {
                 const WASMTableInstance *wasm_table_inst =
                     wasm_module_inst->tables[wasm_export->index];
                 table_inst->elem_kind =
@@ -2420,7 +2485,7 @@ wasm_runtime_get_export_table_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < aot_module->export_count; i++) {
             const AOTExport *aot_export = &aot_module->exports[i];
             if ((aot_export->kind == WASM_IMPORT_EXPORT_KIND_TABLE)
-                && !strcmp(aot_export->name, name)) {
+                && wasm_name_equals(aot_export->name, aot_export->name_len, name)) {
                 const AOTTableInstance *aot_table_inst =
                     aot_module_inst->tables[aot_export->index];
                 table_inst->elem_kind =
@@ -7779,7 +7844,8 @@ loader_find_export(const WASMModuleCommon *module, const char *module_name,
     }
 #endif
     for (i = 0, export = exports; i < export_count; ++i, ++export) {
-        if (export->kind == export_kind && !strcmp(field_name, export->name)) {
+        if (export->kind == export_kind
+            && wasm_name_equals(export->name, export->name_len, field_name)) {
             result = export;
             goto exit;
         }

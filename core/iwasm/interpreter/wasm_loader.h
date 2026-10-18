@@ -45,6 +45,16 @@ wasm_loader_compile_llvm_jit_ex(WASMModule *module,
                                 uint64 native_map_limit, char *error_buf,
                                 uint32 error_buf_size);
 
+#define WASM_LOADER_HAS_LLVM_JIT_INSTRUCTION_PROFILE 1
+/* Same synchronous compiler/owner as _ex, with original-file instruction
+   profiling enabled before translation. The comp_ctx owns the immutable map
+   exposed by aot_jit_profile.h after successful preparation only. */
+bool
+wasm_loader_compile_llvm_jit_profile_ex(WASMModule *module,
+                                        const WASMLoadBudget *budget,
+                                        uint64 max_native_bytes,
+                                        char *error_buf, uint32 error_buf_size);
+
 /**
  * Load a WASM module from a specified WASM section list.
  *

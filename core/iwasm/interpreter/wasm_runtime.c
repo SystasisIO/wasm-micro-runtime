@@ -1451,7 +1451,8 @@ cmp_export_func_inst(const void *a, const void *b)
     const WASMExportFuncInstance *export_func2 =
         (const WASMExportFuncInstance *)b;
 
-    return strcmp(export_func1->name, export_func2->name);
+    return wasm_name_compare(export_func1->name, export_func1->name_len,
+                             export_func2->name, export_func2->name_len);
 }
 
 /**
@@ -1477,6 +1478,7 @@ export_functions_instantiate(const WASMModule *module,
     for (i = 0; i < module->export_count; i++, export ++)
         if (export->kind == EXPORT_KIND_FUNC) {
             export_func->name = export->name;
+            export_func->name_len = export->name_len;
             export_func->function = &module_inst->e->functions[export->index];
             export_func++;
         }
@@ -1522,6 +1524,7 @@ export_tags_instantiate(const WASMModule *module,
     for (i = 0; i < module->export_count; i++, export ++)
         if (export->kind == EXPORT_KIND_TAG) {
             export_tag->name = export->name;
+            export_tag->name_len = export->name_len;
 
             bh_assert(module_inst->e->tags);
 
@@ -1562,6 +1565,7 @@ export_memories_instantiate(const WASMModule *module,
     for (i = 0; i < module->export_count; i++, export ++)
         if (export->kind == EXPORT_KIND_MEMORY) {
             export_memory->name = export->name;
+            export_memory->name_len = export->name_len;
             export_memory->memory = module_inst->memories[export->index];
             export_memory++;
         }
@@ -1599,6 +1603,7 @@ export_globals_instantiate(const WASMModule *module,
     for (i = 0; i < module->export_count; i++, export ++)
         if (export->kind == EXPORT_KIND_GLOBAL) {
             export_global->name = export->name;
+            export_global->name_len = export->name_len;
             export_global->global = &module_inst->e->globals[export->index];
             export_global++;
         }
@@ -3571,7 +3576,11 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
 WASMFunctionInstance *
 wasm_lookup_function(const WASMModuleInstance *module_inst, const char *name)
 {
-    WASMExportFuncInstance key = { .name = (char *)name };
+    size_t name_len = strlen(name);
+    if (name_len > UINT32_MAX)
+        return NULL;
+    WASMExportFuncInstance key = { .name = (char *)name,
+                                  .name_len = (uint32)name_len };
     WASMExportFuncInstance *export_func_inst;
 
     if (!module_inst->export_functions)
@@ -3593,7 +3602,8 @@ wasm_lookup_memory(const WASMModuleInstance *module_inst, const char *name)
 #if WASM_ENABLE_MULTI_MEMORY != 0
     uint32 i;
     for (i = 0; i < module_inst->export_memory_count; i++)
-        if (!strcmp(module_inst->export_memories[i].name, name))
+        if (wasm_name_equals(module_inst->export_memories[i].name,
+                             module_inst->export_memories[i].name_len, name))
             return module_inst->export_memories[i].memory;
     return NULL;
 #else
@@ -3610,7 +3620,8 @@ wasm_lookup_global(const WASMModuleInstance *module_inst, const char *name)
 {
     uint32 i;
     for (i = 0; i < module_inst->export_global_count; i++)
-        if (!strcmp(module_inst->export_globals[i].name, name))
+        if (wasm_name_equals(module_inst->export_globals[i].name,
+                             module_inst->export_globals[i].name_len, name))
             return module_inst->export_globals[i].global;
     return NULL;
 }
@@ -3633,7 +3644,8 @@ wasm_lookup_tag(const WASMModuleInstance *module_inst, const char *name,
 {
     uint32 i;
     for (i = 0; i < module_inst->e->export_tag_count; i++)
-        if (!strcmp(module_inst->e->export_tags[i].name, name))
+        if (wasm_name_equals(module_inst->e->export_tags[i].name,
+                             module_inst->e->export_tags[i].name_len, name))
             return module_inst->e->export_tags[i].tag;
     (void)signature;
     return NULL;
@@ -4265,7 +4277,7 @@ wasm_get_module_mem_consumption(const WASMModule *module,
         while (node) {
             node_next = node->next;
             mem_conspn->const_strs_size +=
-                sizeof(StringNode) + strlen(node->str) + 1;
+                sizeof(StringNode) + node->len + 1;
             node = node_next;
         }
     }
@@ -5084,85 +5096,15 @@ wasm_propagate_wasi_args(WASMModule *module)
 }
 #endif
 
-bool
-wasm_check_utf8_str(const uint8 *str, uint32 len)
-{
-    /* The valid ranges are taken from page 125, below link
-       https://www.unicode.org/versions/Unicode9.0.0/ch03.pdf */
-    const uint8 *p = str, *p_end = str + len;
-    uint8 chr;
-
-    while (p < p_end) {
-        chr = *p;
-
-        if (chr == 0) {
-            LOG_WARNING(
-                "LIMITATION: a string which contains '\\00' is unsupported");
-            return false;
-        }
-        else if (chr < 0x80) {
-            p++;
-        }
-        else if (chr >= 0xC2 && chr <= 0xDF && p + 1 < p_end) {
-            if (p[1] < 0x80 || p[1] > 0xBF) {
-                return false;
-            }
-            p += 2;
-        }
-        else if (chr >= 0xE0 && chr <= 0xEF && p + 2 < p_end) {
-            if (chr == 0xE0) {
-                if (p[1] < 0xA0 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF) {
-                    return false;
-                }
-            }
-            else if (chr == 0xED) {
-                if (p[1] < 0x80 || p[1] > 0x9F || p[2] < 0x80 || p[2] > 0xBF) {
-                    return false;
-                }
-            }
-            else { /* chr >= 0xE1 && chr <= 0xEF */
-                if (p[1] < 0x80 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF) {
-                    return false;
-                }
-            }
-            p += 3;
-        }
-        else if (chr >= 0xF0 && chr <= 0xF4 && p + 3 < p_end) {
-            if (chr == 0xF0) {
-                if (p[1] < 0x90 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF
-                    || p[3] < 0x80 || p[3] > 0xBF) {
-                    return false;
-                }
-            }
-            else if (chr <= 0xF3) { /* and also chr >= 0xF1 */
-                if (p[1] < 0x80 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF
-                    || p[3] < 0x80 || p[3] > 0xBF) {
-                    return false;
-                }
-            }
-            else { /* chr == 0xF4 */
-                if (p[1] < 0x80 || p[1] > 0x8F || p[2] < 0x80 || p[2] > 0xBF
-                    || p[3] < 0x80 || p[3] > 0xBF) {
-                    return false;
-                }
-            }
-            p += 4;
-        }
-        else {
-            return false;
-        }
-    }
-    return (p == p_end);
-}
-
-char *
-wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
-                           bool is_load_from_file_buf, char *error_buf,
-                           uint32 error_buf_size)
+static char *
+const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
+                      bool is_load_from_file_buf, bool allow_null,
+                      char *error_buf, uint32 error_buf_size)
 {
     StringNode *node, *node_next;
 
-    if (!wasm_check_utf8_str(str, len)) {
+    if (!(allow_null ? wasm_check_export_name(str, len)
+                    : wasm_check_utf8_str(str, len))) {
         set_error_buf(error_buf, error_buf_size, "invalid UTF-8 encoding");
         return NULL;
     }
@@ -5184,7 +5126,7 @@ wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
     node = module->const_str_list;
     while (node) {
         node_next = node->next;
-        if (strlen(node->str) == len && !memcmp(node->str, str, len))
+        if (node->len == len && !memcmp(node->str, str, len))
             break;
         node = node_next;
     }
@@ -5199,6 +5141,7 @@ wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
     }
 
     node->str = ((char *)node) + sizeof(StringNode);
+    node->len = len;
     bh_memcpy_s(node->str, len + 1, str, len);
     node->str[len] = '\0';
 
@@ -5214,6 +5157,24 @@ wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
     }
 
     return node->str;
+}
+
+char *
+wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
+                           bool is_load_from_file_buf, char *error_buf,
+                           uint32 error_buf_size)
+{
+    return const_str_list_insert(str, len, module, is_load_from_file_buf, false,
+                                 error_buf, error_buf_size);
+}
+
+char *
+wasm_export_name_insert(const uint8 *str, uint32 len, WASMModule *module,
+                        bool is_load_from_file_buf, char *error_buf,
+                        uint32 error_buf_size)
+{
+    return const_str_list_insert(str, len, module, is_load_from_file_buf, true,
+                                 error_buf, error_buf_size);
 }
 
 bool

@@ -24,6 +24,7 @@
 #endif
 #if WASM_ENABLE_JIT != 0
 #include "../compilation/aot_llvm.h"
+#include "../compilation/aot_jit_profile.h"
 #endif
 
 #ifndef TRACE_WASM_LOADER
@@ -3530,7 +3531,10 @@ fail:
 static int
 cmp_export_name(const void *a, const void *b)
 {
-    return strcmp(*(char **)a, *(char **)b);
+    const WASMExport *left = *(const WASMExport *const *)a;
+    const WASMExport *right = *(const WASMExport *const *)b;
+    return wasm_name_compare(left->name, left->name_len,
+                             right->name, right->name_len);
 }
 
 static bool
@@ -4444,10 +4448,10 @@ check_duplicate_exports(WASMModule *module, char *error_buf,
 {
     uint32 i;
     bool result = false;
-    char *names_buf[32], **names = names_buf;
+    const WASMExport *names_buf[32], **names = names_buf;
 
     if (module->export_count > 32) {
-        names = loader_malloc(module->export_count * sizeof(char *), error_buf,
+        names = loader_malloc(module->export_count * sizeof(*names), error_buf,
                               error_buf_size);
         if (!names) {
             return result;
@@ -4455,13 +4459,13 @@ check_duplicate_exports(WASMModule *module, char *error_buf,
     }
 
     for (i = 0; i < module->export_count; i++) {
-        names[i] = module->exports[i].name;
+        names[i] = &module->exports[i];
     }
 
-    qsort(names, module->export_count, sizeof(char *), cmp_export_name);
+    qsort(names, module->export_count, sizeof(*names), cmp_export_name);
 
     for (i = 1; i < module->export_count; i++) {
-        if (!strcmp(names[i], names[i - 1])) {
+        if (cmp_export_name(&names[i], &names[i - 1]) == 0) {
             set_error_buf(error_buf, error_buf_size, "duplicate export name");
             goto cleanup;
         }
@@ -4510,7 +4514,8 @@ load_export_section(const uint8 *buf, const uint8 *buf_end, WASMModule *module,
             read_leb_uint32(p, p_end, str_len);
             CHECK_BUF(p, p_end, str_len);
 
-            if (!(export->name = wasm_const_str_list_insert(
+            export->name_len = str_len;
+            if (!(export->name = wasm_export_name_insert(
                       p, str_len, module, is_load_from_file_buf, error_buf,
                       error_buf_size))) {
                 return false;
@@ -6340,11 +6345,11 @@ wasm_loader_compile_llvm_jit(WASMModule *module, char *error_buf,
     return false;
 }
 
-bool
-wasm_loader_compile_llvm_jit_ex(WASMModule *module,
-                                const WASMLoadBudget *budget,
-                                uint64 native_map_limit, char *error_buf,
-                                uint32 error_buf_size)
+static bool
+compile_llvm_jit_impl(
+    WASMModule *module, const WASMLoadBudget *budget, uint64 native_map_limit,
+    bool instruction_profile, char *error_buf,
+    uint32 error_buf_size)
 {
 #if WASM_ENABLE_JIT != 0 && WASM_ENABLE_FAST_JIT == 0 \
     && WASM_ENABLE_LAZY_JIT == 0
@@ -6365,11 +6370,18 @@ wasm_loader_compile_llvm_jit_ex(WASMModule *module,
         set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
         return false;
     }
-    if (!module->function_count)
+    if (!module->function_count) {
         return true;
+    }
     if (!init_llvm_jit_functions_stage1(module, budget, native_map_limit,
-                                       error_buf, error_buf_size)
-        || !init_llvm_jit_functions_stage2(module, error_buf, error_buf_size))
+                                       error_buf, error_buf_size))
+        goto fail;
+    if (instruction_profile
+        && !aot_jit_profile_enable(module->comp_ctx)) {
+        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
+        goto fail;
+    }
+    if (!init_llvm_jit_functions_stage2(module, error_buf, error_buf_size))
         goto fail;
     /* Eager LLJIT lookup has compiled the complete IR module. Unlike the lazy
        worker path there is no reason to invoke native wrapper functions. */
@@ -6389,6 +6401,10 @@ wasm_loader_compile_llvm_jit_ex(WASMModule *module,
         set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
         goto fail;
     }
+    if (!aot_jit_profile_publish(module->comp_ctx)) {
+        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
+        goto fail;
+    }
     return true;
 fail:
     destroy_llvm_jit_functions(module);
@@ -6397,10 +6413,31 @@ fail:
     (void)module;
     (void)budget;
     (void)native_map_limit;
+    (void)instruction_profile;
     set_error_buf(error_buf, error_buf_size,
                   "bounded LLVM JIT requires an LLVM-only eager profile");
     return false;
 #endif
+}
+
+bool
+wasm_loader_compile_llvm_jit_ex(WASMModule *module,
+                                const WASMLoadBudget *budget,
+                                uint64 native_map_limit, char *error_buf,
+                                uint32 error_buf_size)
+{
+    return compile_llvm_jit_impl(module, budget, native_map_limit, false,
+                                 error_buf, error_buf_size);
+}
+
+bool
+wasm_loader_compile_llvm_jit_profile_ex(WASMModule *module,
+                                        const WASMLoadBudget *budget,
+                                        uint64 max_native_bytes,
+                                        char *error_buf, uint32 error_buf_size)
+{
+    return compile_llvm_jit_impl(module, budget, max_native_bytes, true,
+                                 error_buf, error_buf_size);
 }
 
 static bool
@@ -6578,7 +6615,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
     export = module->exports;
     for (i = 0; i < module->export_count; i++, export ++) {
         if (export->kind == EXPORT_KIND_GLOBAL) {
-            if (!strcmp(export->name, "__heap_base")) {
+            if (wasm_name_equals(export->name, export->name_len, "__heap_base")) {
                 if (export->index < module->import_global_count) {
                     LOG_DEBUG("Skip the process if __heap_base is imported "
                               "instead of being a local global");
@@ -6600,7 +6637,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                                 aux_heap_base);
                 }
             }
-            else if (!strcmp(export->name, "__data_end")) {
+            else if (wasm_name_equals(export->name, export->name_len, "__data_end")) {
                 if (export->index < module->import_global_count) {
                     LOG_DEBUG("Skip the process if __data_end is imported "
                               "instead of being a local global");
@@ -6706,7 +6743,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
     export = module->exports;
     for (i = 0; i < module->export_count; i++, export ++) {
         if (export->kind == EXPORT_KIND_FUNC) {
-            if (!strcmp(export->name, "malloc")
+            if (wasm_name_equals(export->name, export->name_len, "malloc")
                 && export->index >= module->import_function_count) {
                 func_index = export->index - module->import_function_count;
                 func_type = module->functions[func_index]->func_type;
@@ -6719,7 +6756,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                                 export->name, export->index);
                 }
             }
-            else if (!strcmp(export->name, "__new")
+            else if (wasm_name_equals(export->name, export->name_len, "__new")
                      && export->index >= module->import_function_count) {
                 /* __new && __pin for AssemblyScript */
                 func_index = export->index - module->import_function_count;
@@ -6741,8 +6778,8 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                     export_tmp = module->exports;
                     for (j = 0; j < module->export_count; j++, export_tmp++) {
                         if ((export_tmp->kind == EXPORT_KIND_FUNC)
-                            && (!strcmp(export_tmp->name, "__retain")
-                                || (!strcmp(export_tmp->name, "__pin")))
+                            && (wasm_name_equals(export_tmp->name, export_tmp->name_len, "__retain")
+                                || wasm_name_equals(export_tmp->name, export_tmp->name_len, "__pin"))
                             && (export_tmp->index
                                 >= module->import_function_count)) {
                             func_index = export_tmp->index
@@ -6771,9 +6808,9 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                     }
                 }
             }
-            else if (((!strcmp(export->name, "free"))
-                      || (!strcmp(export->name, "__release"))
-                      || (!strcmp(export->name, "__unpin")))
+            else if ((wasm_name_equals(export->name, export->name_len, "free")
+                      || wasm_name_equals(export->name, export->name_len, "__release")
+                      || wasm_name_equals(export->name, export->name_len, "__unpin"))
                      && export->index >= module->import_function_count) {
                 func_index = export->index - module->import_function_count;
                 func_type = module->functions[func_index]->func_type;

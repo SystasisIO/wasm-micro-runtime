@@ -558,6 +558,7 @@ typedef struct AOTCompContext {
 
     /* Current frame information for translation */
     AOTCompFrame *aot_frame;
+    struct AOTJitProfile *jit_instruction_profile;
 } AOTCompContext;
 
 enum {

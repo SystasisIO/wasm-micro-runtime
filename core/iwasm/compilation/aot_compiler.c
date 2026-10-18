@@ -4,6 +4,7 @@
  */
 
 #include "aot_compiler.h"
+#include "aot_jit_profile.h"
 #include "aot_emit_compare.h"
 #include "aot_emit_conversion.h"
 #include "aot_emit_memory.h"
@@ -1093,6 +1094,10 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
     LLVMMetadataRef location;
 #endif
 
+    if (comp_ctx->jit_instruction_profile
+        && !aot_jit_profile_location(comp_ctx, func_ctx, NULL))
+        return false;
+
     /* Start to translate the opcodes */
     LLVMPositionBuilderAtEnd(
         comp_ctx->builder,
@@ -1116,6 +1121,10 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
 
     while (frame_ip < frame_ip_end) {
         opcode = *frame_ip++;
+
+        if (comp_ctx->jit_instruction_profile
+            && !aot_jit_profile_location(comp_ctx, func_ctx, frame_ip - 1))
+            return false;
 
         if (comp_ctx->aot_frame) {
             comp_ctx->aot_frame->frame_ip = frame_ip - 1;
@@ -4007,6 +4016,10 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
         }
     }
 
+    if (comp_ctx->jit_instruction_profile
+        && !aot_jit_profile_location(comp_ctx, func_ctx, NULL))
+        return false;
+
     if (!forge_instrument_call_depth(comp_ctx, func_ctx))
         return false;
 
@@ -4116,6 +4129,9 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 #if WASM_ENABLE_DEBUG_AOT != 0
     LLVMDIBuilderFinalize(comp_ctx->debug_builder);
 #endif
+
+    if (!aot_jit_profile_finalize(comp_ctx))
+        return false;
 
     /* Disable LLVM module verification for jit mode to speedup
        the compilation process */

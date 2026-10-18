@@ -802,9 +802,26 @@ struct WASMGlobal {
 
 typedef struct WASMExport {
     char *name;
+    uint32 name_len;
     uint8 kind;
     uint32 index;
 } WASMExport;
+
+static inline int
+wasm_name_compare(const char *left, uint32 left_len,
+                 const char *right, uint32 right_len)
+{
+    uint32 size = left_len < right_len ? left_len : right_len;
+    int order = size ? memcmp(left, right, size) : 0;
+    return order ? order : (left_len > right_len) - (left_len < right_len);
+}
+
+static inline bool
+wasm_name_equals(const char *name, uint32 name_len, const char *text)
+{
+    size_t text_len = strlen(text);
+    return name_len == text_len && !memcmp(name, text, text_len);
+}
 
 typedef struct WASMTableSeg {
     /* 0 to 7 */
@@ -861,6 +878,7 @@ typedef struct WASIArguments {
 typedef struct StringNode {
     struct StringNode *next;
     char *str;
+    uint32 len;
 } StringNode, *StringList;
 
 typedef struct BrTableCache {

@@ -286,27 +286,32 @@ struct WASMTagInstance {
 #endif
 typedef struct WASMExportFuncInstance {
     char *name;
+    uint32 name_len;
     WASMFunctionInstance *function;
 } WASMExportFuncInstance;
 
 typedef struct WASMExportGlobInstance {
     char *name;
+    uint32 name_len;
     WASMGlobalInstance *global;
 } WASMExportGlobInstance;
 
 typedef struct WASMExportTabInstance {
     char *name;
+    uint32 name_len;
     WASMTableInstance *table;
 } WASMExportTabInstance;
 
 typedef struct WASMExportMemInstance {
     char *name;
+    uint32 name_len;
     WASMMemoryInstance *memory;
 } WASMExportMemInstance;
 
 #if WASM_ENABLE_TAGS != 0
 typedef struct WASMExportTagInstance {
     char *name;
+    uint32 name_len;
     WASMTagInstance *tag;
 } WASMExportTagInstance;
 #endif
@@ -918,13 +923,15 @@ exception_unlock(WASMModuleInstance *module_inst);
 #define exception_unlock(module_inst) (void)(module_inst)
 #endif
 
-bool
-wasm_check_utf8_str(const uint8 *str, uint32 len);
-
 char *
 wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
                            bool is_load_from_file_buf, char *error_buf,
                            uint32 error_buf_size);
+
+char *
+wasm_export_name_insert(const uint8 *str, uint32 len, WASMModule *module,
+                        bool is_load_from_file_buf, char *error_buf,
+                        uint32 error_buf_size);
 
 bool
 wasm_set_module_name(WASMModule *module, const char *name, char *error_buf,

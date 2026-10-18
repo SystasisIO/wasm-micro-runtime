@@ -6,6 +6,7 @@
 #include "aot_llvm.h"
 #include "aot_llvm_extra2.h"
 #include "aot_compiler.h"
+#include "aot_jit_profile.h"
 #include "aot_emit_exception.h"
 #include "aot_emit_table.h"
 #include "../aot/aot_runtime.h"
@@ -3552,6 +3553,10 @@ aot_destroy_comp_context(AOTCompContext *comp_ctx)
     if (!comp_ctx)
         return;
 
+    /* Failed/canceled profiling can still own a DIBuilder referencing module
+       metadata. Release it before either the context or ORC module dies. */
+    aot_jit_profile_discard_metadata(comp_ctx);
+
     if (comp_ctx->stack_usage_file == comp_ctx->stack_usage_temp_file) {
         (void)unlink(comp_ctx->stack_usage_temp_file);
     }
@@ -3579,6 +3584,8 @@ aot_destroy_comp_context(AOTCompContext *comp_ctx)
     /* Has to be the last one */
     if (comp_ctx->orc_jit)
         LLVMOrcDisposeLLLazyJIT(comp_ctx->orc_jit);
+
+    aot_jit_profile_destroy(comp_ctx);
 
     if (comp_ctx->func_ctxes)
         aot_destroy_func_contexts(comp_ctx, comp_ctx->func_ctxes,

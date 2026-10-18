@@ -3009,15 +3009,21 @@ fail:
 }
 
 static void
-destroy_exports(AOTExport *exports)
+destroy_exports(AOTExport *exports, uint32 count)
 {
+    uint32 i;
+    for (i = 0; i < count; i++)
+        wasm_runtime_free(exports[i].name);
     wasm_runtime_free(exports);
 }
 
 static int
 cmp_export_name(const void *a, const void *b)
 {
-    return strcmp(*(char **)a, *(char **)b);
+    const AOTExport *left = *(const AOTExport *const *)a;
+    const AOTExport *right = *(const AOTExport *const *)b;
+    return wasm_name_compare(left->name, left->name_len,
+                             right->name, right->name_len);
 }
 
 static bool
@@ -3026,9 +3032,9 @@ check_duplicate_exports(AOTModule *module, char *error_buf,
 {
     uint32 i;
     bool result = false;
-    char *names_buf[32], **names = names_buf;
+    const AOTExport *names_buf[32], **names = names_buf;
     if (module->export_count > 32) {
-        names = loader_malloc(module->export_count * sizeof(char *), error_buf,
+        names = loader_malloc(module->export_count * sizeof(*names), error_buf,
                               error_buf_size);
         if (!names) {
             return result;
@@ -3036,13 +3042,13 @@ check_duplicate_exports(AOTModule *module, char *error_buf,
     }
 
     for (i = 0; i < module->export_count; i++) {
-        names[i] = module->exports[i].name;
+        names[i] = &module->exports[i];
     }
 
-    qsort(names, module->export_count, sizeof(char *), cmp_export_name);
+    qsort(names, module->export_count, sizeof(*names), cmp_export_name);
 
     for (i = 1; i < module->export_count; i++) {
-        if (!strcmp(names[i], names[i - 1])) {
+        if (cmp_export_name(&names[i], &names[i - 1]) == 0) {
             set_error_buf(error_buf, error_buf_size, "duplicate export name");
             goto cleanup;
         }
@@ -3074,9 +3080,32 @@ load_exports(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
 
     /* Create each export */
     for (i = 0; i < module->export_count; i++) {
+        uint16 encoded_len;
         read_uint32(buf, buf_end, exports[i].index);
         read_uint8(buf, buf_end, exports[i].kind);
-        read_string(buf, buf_end, exports[i].name);
+        read_uint16(buf, buf_end, encoded_len);
+        CHECK_BUF(buf, buf_end, encoded_len);
+        exports[i].name_len = encoded_len ? encoded_len - 1 : 0;
+        exports[i].name = loader_malloc((uint32)exports[i].name_len + 1,
+                                         error_buf, error_buf_size);
+        if (!exports[i].name)
+            return false;
+        if (encoded_len) {
+            read_byte_array(buf, buf_end, exports[i].name, encoded_len);
+            if (exports[i].name[exports[i].name_len] != '\0') {
+                set_error_buf(error_buf, error_buf_size,
+                              "export name lacks a terminator");
+                return false;
+            }
+        }
+        else
+            exports[i].name[0] = '\0';
+        if (!wasm_check_export_name((const uint8 *)exports[i].name,
+                                    exports[i].name_len)) {
+            set_error_buf(error_buf, error_buf_size,
+                          "invalid UTF-8 export name");
+            return false;
+        }
 
         /* Check export kind and index */
         switch (exports[i].kind) {
@@ -4216,7 +4245,7 @@ load_from_sections(AOTModule *module, AOTSection *sections,
     for (i = 0; i < module->export_count; i++) {
         if (exports[i].kind == EXPORT_KIND_FUNC
             && exports[i].index >= module->import_func_count) {
-            if (!strcmp(exports[i].name, "malloc")) {
+            if (wasm_name_equals(exports[i].name, exports[i].name_len, "malloc")) {
                 func_index = exports[i].index - module->import_func_count;
                 func_type_index = module->func_type_indexes[func_index];
                 func_type = (AOTFuncType *)module->types[func_type_index];
@@ -4229,7 +4258,7 @@ load_from_sections(AOTModule *module, AOTSection *sections,
                                 exports[i].name, exports[i].index);
                 }
             }
-            else if (!strcmp(exports[i].name, "__new")) {
+            else if (wasm_name_equals(exports[i].name, exports[i].name_len, "__new")) {
                 func_index = exports[i].index - module->import_func_count;
                 func_type_index = module->func_type_indexes[func_index];
                 func_type = (AOTFuncType *)module->types[func_type_index];
@@ -4250,8 +4279,8 @@ load_from_sections(AOTModule *module, AOTSection *sections,
                     export_tmp = module->exports;
                     for (j = 0; j < module->export_count; j++, export_tmp++) {
                         if ((export_tmp->kind == EXPORT_KIND_FUNC)
-                            && (!strcmp(export_tmp->name, "__retain")
-                                || !strcmp(export_tmp->name, "__pin"))) {
+                            && (wasm_name_equals(export_tmp->name, export_tmp->name_len, "__retain")
+                                || wasm_name_equals(export_tmp->name, export_tmp->name_len, "__pin"))) {
                             func_index =
                                 export_tmp->index - module->import_func_count;
                             func_type_index =
@@ -4280,9 +4309,9 @@ load_from_sections(AOTModule *module, AOTSection *sections,
                     }
                 }
             }
-            else if ((!strcmp(exports[i].name, "free"))
-                     || (!strcmp(exports[i].name, "__release"))
-                     || (!strcmp(exports[i].name, "__unpin"))) {
+            else if (wasm_name_equals(exports[i].name, exports[i].name_len, "free")
+                     || wasm_name_equals(exports[i].name, exports[i].name_len, "__release")
+                     || wasm_name_equals(exports[i].name, exports[i].name_len, "__unpin")) {
                 func_index = exports[i].index - module->import_func_count;
                 func_type_index = module->func_type_indexes[func_index];
                 func_type = (AOTFuncType *)module->types[func_type_index];
@@ -4718,7 +4747,7 @@ aot_unload(AOTModule *module)
         destroy_import_funcs(module->import_funcs);
 
     if (module->exports)
-        destroy_exports(module->exports);
+        destroy_exports(module->exports, module->export_count);
 
     if (module->func_type_indexes)
         wasm_runtime_free(module->func_type_indexes);

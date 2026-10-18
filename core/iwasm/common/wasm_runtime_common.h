@@ -28,6 +28,12 @@
 extern "C" {
 #endif
 
+bool
+wasm_check_utf8_str(const uint8 *str, uint32 len);
+
+bool
+wasm_check_export_name(const uint8 *str, uint32 len);
+
 /* Internal use for setting default running mode */
 #define Mode_Default 0
 
