@@ -1758,13 +1758,13 @@ wasm_runtime_instantiate_internal(WASMModuleCommon *module,
 {
     WASMFPEnvironment env;
     WASMModuleInstanceCommon *result;
-    if (!wasm_fp_enter(&env)) {
+    if (!wasm_fp_enter(&env, exec_env_main)) {
         set_error_buf(error_buf, error_buf_size, "FP environment setup failed");
         return NULL;
     }
     result = instantiate_unguarded(module, parent, exec_env_main, args,
                                    error_buf, error_buf_size);
-    if (!wasm_fp_leave(&env)) {
+    if (!wasm_fp_leave(&env, exec_env_main)) {
         if (result)
             wasm_runtime_deinstantiate(result);
         set_error_buf(error_buf, error_buf_size, "FP environment restore failed");
@@ -1873,7 +1873,7 @@ wasm_runtime_initialize_with_exec_env(WASMModuleInstanceCommon *module_inst,
     WASMFPEnvironment env;
     bool result = false;
     if (!module_inst || (exec_env && exec_env->module_inst != module_inst)
-        || !wasm_fp_enter(&env))
+        || !wasm_fp_enter(&env, exec_env))
         return false;
 #if WASM_ENABLE_INTERP != 0
     if (module_inst->module_type == Wasm_Module_Bytecode)
@@ -1883,7 +1883,7 @@ wasm_runtime_initialize_with_exec_env(WASMModuleInstanceCommon *module_inst,
     if (module_inst->module_type == Wasm_Module_AoT)
         result = aot_initialize((AOTModuleInstance *)module_inst, exec_env);
 #endif
-    return wasm_fp_leave(&env) && result;
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 #if WASM_ENABLE_LIBC_WASI != 0
@@ -2953,10 +2953,10 @@ wasm_runtime_call_wasm(WASMExecEnv *exec_env,
 {
     WASMFPEnvironment env;
     bool result;
-    if (!wasm_fp_enter(&env))
+    if (!wasm_fp_enter(&env, exec_env))
         return false;
     result = call_wasm_unguarded(exec_env, function, argc, argv);
-    return wasm_fp_leave(&env) && result;
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 static void
@@ -6593,11 +6593,11 @@ wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
 {
     WASMFPEnvironment env;
     bool result;
-    if (!wasm_fp_enter(&env))
+    if (!wasm_fp_enter(&env, exec_env))
         return false;
     result = invoke_native_unguarded(exec_env, func_ptr, func_type, signature,
                                      attachment, argv, argc, argv_ret);
-    return wasm_fp_leave(&env) && result;
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 bool
@@ -6608,11 +6608,11 @@ wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
 {
     WASMFPEnvironment env;
     bool result;
-    if (!wasm_fp_enter(&env))
+    if (!wasm_fp_enter(&env, exec_env))
         return false;
     result = invoke_native_raw_unguarded(exec_env, func_ptr, func_type, signature,
                                          attachment, argv, argc, argv_ret);
-    return wasm_fp_leave(&env) && result;
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 static bool
@@ -6648,10 +6648,10 @@ wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
 {
     WASMFPEnvironment env;
     bool result;
-    if (!wasm_fp_enter(&env))
+    if (!wasm_fp_enter(&env, exec_env))
         return false;
     result = call_indirect_unguarded(exec_env, element_index, argc, argv);
-    return wasm_fp_leave(&env) && result;
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 static void
