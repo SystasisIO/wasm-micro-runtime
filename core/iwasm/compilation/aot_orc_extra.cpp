@@ -144,17 +144,19 @@ DEFINE_SIMPLE_CONVERSION_FUNCTIONS(LLLazyJITBuilder, LLVMOrcLLLazyJITBuilderRef)
 struct WamrOrcJIT {
     std::unique_ptr<LLJIT> jit;
     bool lazy;
+    bool bounded;
 };
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(WamrOrcJIT, LLVMOrcLLLazyJITRef)
 
 static LLVMErrorRef
-own_jit(LLVMOrcLLLazyJITRef *Result, std::unique_ptr<LLJIT> J, bool Lazy)
+own_jit(LLVMOrcLLLazyJITRef *Result, std::unique_ptr<LLJIT> J, bool Lazy,
+        bool Bounded = false)
 {
     void *storage = wasm_runtime_malloc(sizeof(WamrOrcJIT));
     if (!storage)
         return wrap(make_error<StringError>("WAMR JIT handle allocation failed",
                                              inconvertibleErrorCode()));
-    *Result = wrap(new (storage) WamrOrcJIT{std::move(J), Lazy});
+    *Result = wrap(new (storage) WamrOrcJIT{std::move(J), Lazy, Bounded});
     return LLVMErrorSuccess;
 }
 
@@ -312,7 +314,19 @@ LLVMOrcCreateBoundedLLJIT(LLVMOrcLLLazyJITRef *Result,
     auto J = eager.create();
     if (!J)
         return wrap(J.takeError());
-    return own_jit(Result, std::move(*J), false);
+    return own_jit(Result, std::move(*J), false, true);
+}
+
+WASMNativeCodePolicy
+LLVMOrcLLLazyJITGetNativeCodePolicy(LLVMOrcLLLazyJITRef J)
+{
+    if (!J)
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+    const auto &handle = *unwrap(J);
+    if (!handle.bounded || handle.lazy || !handle.jit)
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+    return aot_get_bounded_jit_native_code_policy(
+        reinterpret_cast<LLVMOrcLLJITRef>(handle.jit.get()));
 }
 
 LLVMErrorRef

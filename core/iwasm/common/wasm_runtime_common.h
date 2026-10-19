@@ -506,6 +506,11 @@ typedef struct WASMModuleCommon {
     uint8 module_data[1];
 } WASMModuleCommon;
 
+/* Read an immutable publication snapshot while the module owner is pinned.
+   NONE is valid only for modules without defined native guest bodies. */
+WASMNativeCodePolicy
+wasm_runtime_get_native_code_policy(const WASMModuleCommon *module);
+
 typedef struct WASMModuleInstanceCommon {
     /* Module instance type, for module instance loaded from WASM
        bytecode binary, this field is Wasm_Module_Bytecode, and this

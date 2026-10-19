@@ -25,6 +25,7 @@
 #if WASM_ENABLE_JIT != 0
 #include "../compilation/aot_llvm.h"
 #include "../compilation/aot_jit_profile.h"
+#include "../compilation/aot_orc_extra.h"
 #endif
 
 #ifndef TRACE_WASM_LOADER
@@ -6354,6 +6355,7 @@ compile_llvm_jit_impl(
 #if WASM_ENABLE_JIT != 0 && WASM_ENABLE_FAST_JIT == 0 \
     && WASM_ENABLE_LAZY_JIT == 0
     uint32 i;
+    WASMNativeCodePolicy policy;
     if (!module || module->module_type != Wasm_Module_Bytecode || !budget
         || !budget->begin_mapping || !budget->complete_mapping || !budget->unmap
         || !budget->check || !budget->before_protect || !budget->allocation_failed
@@ -6366,11 +6368,13 @@ compile_llvm_jit_impl(
         set_error_buf(error_buf, error_buf_size, "LLVM JIT module already has compiler state");
         return false;
     }
+    module->native_code_policy = WASM_NATIVE_CODE_UNCOMMITTED;
     if (!budget->check(budget->context)) {
         set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
         return false;
     }
     if (!module->function_count) {
+        module->native_code_policy = WASM_NATIVE_CODE_NONE;
         return true;
     }
     if (!init_llvm_jit_functions_stage1(module, budget, native_map_limit,
@@ -6405,8 +6409,21 @@ compile_llvm_jit_impl(
         set_error_buf(error_buf, error_buf_size, aot_get_last_error());
         goto fail;
     }
+    if (!budget->check(budget->context)) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
+        goto fail;
+    }
+    policy = LLVMOrcLLLazyJITGetNativeCodePolicy(module->comp_ctx->orc_jit);
+    if (policy != WASM_NATIVE_CODE_RX && policy != WASM_NATIVE_CODE_MAP_JIT) {
+        budget->protection_failed(budget->context);
+        set_error_buf(error_buf, error_buf_size,
+                      "LLVM JIT native protection is uncommitted");
+        goto fail;
+    }
+    module->native_code_policy = policy;
     return true;
 fail:
+    module->native_code_policy = WASM_NATIVE_CODE_UNCOMMITTED;
     destroy_llvm_jit_functions(module);
     return false;
 #else
@@ -6977,6 +6994,8 @@ load_from_sections(WASMModule *module, WASMSection *sections,
 #if WASM_ENABLE_MEMORY_TRACING != 0
     wasm_runtime_dump_module_mem_consumption((WASMModuleCommon *)module);
 #endif
+    if (!module->function_count)
+        module->native_code_policy = WASM_NATIVE_CODE_NONE;
     return true;
 }
 

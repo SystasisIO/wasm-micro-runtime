@@ -17,6 +17,14 @@
 extern "C" {
 #endif
 
+/* Internal native-code publication state, not an OS capability estimate. */
+typedef enum WASMNativeCodePolicy {
+    WASM_NATIVE_CODE_UNCOMMITTED = 0,
+    WASM_NATIVE_CODE_NONE,
+    WASM_NATIVE_CODE_RX,
+    WASM_NATIVE_CODE_MAP_JIT
+} WASMNativeCodePolicy;
+
 /* Value Type */
 #define VALUE_TYPE_I32 0x7F
 #define VALUE_TYPE_I64 0X7E
@@ -1188,6 +1196,9 @@ struct WASMModule {
 
     /* Whether the underlying wasm binary buffer can be freed */
     bool is_binary_freeable;
+
+    /* Published only after complete bounded eager-JIT preparation. */
+    WASMNativeCodePolicy native_code_policy;
 };
 
 typedef struct BlockType {

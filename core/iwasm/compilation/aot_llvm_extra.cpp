@@ -127,6 +127,7 @@ class BoundedJitMemory final : public jitlink::JITLinkMemoryManager,
         size_t count = 0;
         Action *actions = nullptr;
         bool registered = false;
+        bool committed = false;
     };
     class Flight final : public InFlightAlloc, public JitOwned {
       public:
@@ -183,6 +184,50 @@ class BoundedJitMemory final : public jitlink::JITLinkMemoryManager,
         for (auto &allocation : llvm::reverse(allocations))
             error = joinErrors(std::move(error), destroy(allocation.release().toPtr<Record *>()));
         done(std::move(error));
+    }
+
+    WASMNativeCodePolicy native_code_policy() const
+    {
+        auto policy = WASM_NATIVE_CODE_NONE;
+        for (const auto *record = records; record; record = record->next) {
+            if (!record->committed)
+                return WASM_NATIVE_CODE_UNCOMMITTED;
+            for (size_t i = 0; i < record->count; ++i) {
+                const auto &segment = record->segments[i];
+                if (segment.temporary) {
+                    if (segment.address)
+                        return WASM_NATIVE_CODE_UNCOMMITTED;
+                    continue;
+                }
+                if (!segment.address)
+                    return WASM_NATIVE_CODE_UNCOMMITTED;
+                if (!(segment.protection & MMAP_PROT_EXEC))
+                    continue;
+                if (segment.protection != (MMAP_PROT_READ | MMAP_PROT_EXEC))
+                    return WASM_NATIVE_CODE_UNCOMMITTED;
+                if (segment.jit) {
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+                    if ((segment.flags & MMAP_MAP_NO_JIT)
+                        || segment.initial_protection
+                               != (MMAP_PROT_READ | MMAP_PROT_WRITE
+                                   | MMAP_PROT_EXEC))
+                        return WASM_NATIVE_CODE_UNCOMMITTED;
+#else
+                    return WASM_NATIVE_CODE_UNCOMMITTED;
+#endif
+                }
+                else if (!(segment.flags & MMAP_MAP_NO_JIT)
+                         || segment.initial_protection
+                                != (MMAP_PROT_READ | MMAP_PROT_WRITE))
+                    return WASM_NATIVE_CODE_UNCOMMITTED;
+                const auto current = segment.jit ? WASM_NATIVE_CODE_MAP_JIT
+                                                 : WASM_NATIVE_CODE_RX;
+                if (policy != WASM_NATIVE_CODE_NONE && policy != current)
+                    return WASM_NATIVE_CODE_UNCOMMITTED;
+                policy = current;
+            }
+        }
+        return policy;
     }
 
   private:
@@ -256,11 +301,7 @@ class BoundedJitMemory final : public jitlink::JITLinkMemoryManager,
         int flags = MMAP_MAP_NO_HUGE | MMAP_MAP_NO_JIT;
         int protection = MMAP_PROT_READ | MMAP_PROT_WRITE;
 #if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
-        if (executable) {
-            if (!os_thread_jit_write_protect_supported()) {
-                budget.protection_failed(budget.context);
-                return jit_memory_error("Native JIT write protection is unavailable");
-            }
+        if (executable && os_thread_jit_write_protect_supported()) {
             flags = MMAP_MAP_NO_HUGE;
             protection |= MMAP_PROT_EXEC;
             segment.jit = true;
@@ -338,7 +379,13 @@ class BoundedJitMemory final : public jitlink::JITLinkMemoryManager,
             const bool code = segment.protection & MMAP_PROT_EXEC;
             if (code) {
 #if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
-                const bool previous = os_thread_jit_write_protect_state();
+                if (segment.jit && !os_thread_jit_write_protect_supported()) {
+                    budget.protection_failed(budget.context);
+                    return jit_memory_error("Native MAP_JIT protection is unavailable");
+                }
+                const bool previous = segment.jit
+                                          ? os_thread_jit_write_protect_state()
+                                          : true;
                 if (segment.jit)
                     os_thread_jit_write_protect_np(false);
 #endif
@@ -371,6 +418,9 @@ class BoundedJitMemory final : public jitlink::JITLinkMemoryManager,
             if (record.segments[i].temporary)
                 if (auto error = unmap(record.segments[i]))
                     return error;
+        if (!budget.check(budget.context))
+            return jit_memory_error("JIT preparation canceled or unavailable");
+        record.committed = true;
         return Error::success();
     }
     Error discard_actions(Record &record, bool run)
@@ -476,6 +526,25 @@ aot_configure_bounded_jit_builder(LLVMOrcLLJITBuilderRef builder,
     (void)budget;
     (void)native_map_limit;
     return LLVMCreateStringError("Bounded LLVM JIT requires LLVM 22 on a supported POSIX target");
+#endif
+}
+
+WASMNativeCodePolicy
+aot_get_bounded_jit_native_code_policy(LLVMOrcLLJITRef jit)
+{
+#if LLVM_VERSION_MAJOR >= 22 \
+    && (defined(BH_PLATFORM_DARWIN) || defined(BH_PLATFORM_LINUX))
+    if (!jit)
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+    auto &control = reinterpret_cast<LLJIT *>(jit)
+                        ->getExecutionSession().getExecutorProcessControl();
+    /* The bounded constructor installed this exact manager, not an arbitrary
+       LLVM allocator. The WAMR handle checks that provenance before calling. */
+    return static_cast<const BoundedJitMemory &>(control.getMemMgr())
+        .native_code_policy();
+#else
+    (void)jit;
+    return WASM_NATIVE_CODE_UNCOMMITTED;
 #endif
 }
 

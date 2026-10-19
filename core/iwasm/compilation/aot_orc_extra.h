@@ -12,6 +12,7 @@
 #include "llvm-c/Orc.h"
 #include "llvm-c/Types.h"
 #include "wasm_export.h"
+#include "../interpreter/wasm.h"
 
 LLVM_C_EXTERN_C_BEGIN
 
@@ -48,6 +49,10 @@ LLVMErrorRef
 LLVMOrcCreateBoundedLLJIT(LLVMOrcLLLazyJITRef *Result,
                          LLVMOrcLLLazyJITBuilderRef Builder,
                          const WASMLoadBudget *Budget, uint64_t NativeMapLimit);
+
+/* Preparation-only snapshot of the bounded manager's existing live records. */
+WASMNativeCodePolicy
+LLVMOrcLLLazyJITGetNativeCodePolicy(LLVMOrcLLLazyJITRef J);
 
 LLVMErrorRef
 LLVMOrcDisposeLLLazyJIT(LLVMOrcLLLazyJITRef J);

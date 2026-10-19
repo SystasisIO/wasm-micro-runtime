@@ -364,6 +364,11 @@ typedef struct AOTModule {
 #if WASM_ENABLE_AOT_STACK_FRAME != 0
     uint32 feature_flags;
 #endif
+
+    /* Loader-owned text and its checked final executable protection. */
+    bool load_code_owned;
+    bool load_code_committed;
+    WASMNativeCodePolicy native_code_policy;
 } AOTModule;
 
 #define AOTMemoryInstance WASMMemoryInstance

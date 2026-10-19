@@ -2038,6 +2038,39 @@ wasm_runtime_get_module(WASMModuleInstanceCommon *module_inst)
     return (WASMModuleCommon *)((WASMModuleInstance *)module_inst)->module;
 }
 
+WASMNativeCodePolicy
+wasm_runtime_get_native_code_policy(const WASMModuleCommon *module)
+{
+    WASMNativeCodePolicy policy;
+    uint32 defined_functions;
+    if (!module)
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+    if (module->module_type == Wasm_Module_Bytecode) {
+        const WASMModule *bytecode = (const WASMModule *)module;
+        policy = bytecode->native_code_policy;
+        defined_functions = bytecode->function_count;
+    }
+#if WASM_ENABLE_AOT != 0
+    else if (module->module_type == Wasm_Module_AoT) {
+        const AOTModule *aot = (const AOTModule *)module;
+        policy = aot->native_code_policy;
+        defined_functions = aot->func_count;
+    }
+#endif
+    else
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+
+    if (policy == WASM_NATIVE_CODE_NONE)
+        return defined_functions ? WASM_NATIVE_CODE_UNCOMMITTED : policy;
+    if (policy == WASM_NATIVE_CODE_RX)
+        return policy;
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+    if (policy == WASM_NATIVE_CODE_MAP_JIT)
+        return policy;
+#endif
+    return WASM_NATIVE_CODE_UNCOMMITTED;
+}
+
 WASMExecEnv *
 wasm_runtime_create_exec_env(WASMModuleInstanceCommon *module_inst,
                              uint32 stack_size)

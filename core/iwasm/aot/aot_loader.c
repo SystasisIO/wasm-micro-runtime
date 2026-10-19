@@ -351,9 +351,9 @@ loader_mmap(AOTModule *module, uint32 size, bool prot_exec, char *error_buf,
     int owned_flags = budget->begin_mapping ? MMAP_MAP_NO_HUGE : MMAP_MAP_NONE;
     void *mem, *token = NULL;
 #if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
-    /* Darwin JIT text keeps the native per-thread W^X mechanism. Data must
-       never join a MAP_JIT extent, including default sections and padding. */
-    if (!prot_exec)
+    /* Use MAP_JIT only with the native per-thread W^X mechanism. Otherwise
+       text starts ordinary RW/NX and requires a checked final RX transition. */
+    if (!prot_exec || !os_thread_jit_write_protect_supported())
         owned_flags |= MMAP_MAP_NO_JIT;
 #elif defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
     owned_flags |= MMAP_MAP_NO_JIT;
@@ -373,10 +373,13 @@ loader_mmap(AOTModule *module, uint32 size, bool prot_exec, char *error_buf,
     /* No guest code runs before relocation and the checked final RX transition. */
     mem = loader_mmap_unaccounted(size, prot_exec, owned_flags,
                                  error_buf, error_buf_size);
+    if (mem && prot_exec) {
+        module->load_code_owned = true;
+        module->load_code_committed = false;
 #if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
-    if (mem && prot_exec)
-        module->load_jit_code = true;
+        module->load_jit_code = !(owned_flags & MMAP_MAP_NO_JIT);
 #endif
+    }
     if (!mem && budget->allocation_failed)
         budget->allocation_failed(budget->context);
     if (budget->begin_mapping)
@@ -412,10 +415,8 @@ loader_mprotect(AOTModule *module, void *address, uint32 size, int protection,
         /* MAP_JIT VMA permissions are not effective per-thread permissions.
            Do not apply mprotect to this extent or claim its RWX VMA is W^X. */
         allowed = os_thread_jit_write_protect_supported();
-        if (allowed) {
+        if (allowed)
             os_thread_jit_write_protect_np(true);
-            return true;
-        }
     }
     else
 #endif
@@ -428,6 +429,11 @@ loader_mprotect(AOTModule *module, void *address, uint32 size, int protection,
         set_error_buf(error_buf, error_buf_size, "native protection refused");
         return false;
     }
+    if (module->load_code_owned && module->code
+        && protection == (MMAP_PROT_READ | MMAP_PROT_EXEC)
+        && address == module->literal - sizeof(uint32)
+        && size == sizeof(uint32) + module->literal_size + module->code_size)
+        module->load_code_committed = true;
     return true;
 }
 
@@ -2796,6 +2802,9 @@ try_merge_data_and_text(const uint8 **buf, const uint8 **buf_end,
 
     module->merged_data_text_sections = sections;
     module->merged_data_text_sections_size = (uint32)total_size;
+    module->load_code_owned = true;
+    module->load_code_committed = false;
+    module->load_jit_code = false;
 
     /* order not essential just as compiler does: .text section first */
     *buf = sections;
@@ -4394,6 +4403,20 @@ fail1:
     return NULL;
 }
 
+static void
+publish_native_code_policy(AOTModule *module)
+{
+    /* Borrowed/XIP text has no owned-mapping proof, even if mprotect accepted
+       an address supplied by the caller. Never infer its policy from the OS. */
+    if (!module->func_count && !module->code_size)
+        module->native_code_policy = WASM_NATIVE_CODE_NONE;
+    else if (module->load_code_owned && module->load_code_committed
+             && !module->load_protection_failed && !module->is_indirect_mode)
+        module->native_code_policy = module->load_jit_code
+                                         ? WASM_NATIVE_CODE_MAP_JIT
+                                         : WASM_NATIVE_CODE_RX;
+}
+
 AOTModule *
 aot_load_from_sections(AOTSection *section_list, char *error_buf,
                        uint32 error_buf_size)
@@ -4409,7 +4432,9 @@ aot_load_from_sections(AOTSection *section_list, char *error_buf,
         return NULL;
     }
 
+    os_icache_flush(module->code, module->code_size);
     LOG_VERBOSE("Load module from sections success.\n");
+    publish_native_code_policy(module);
     return module;
 }
 
@@ -4654,10 +4679,12 @@ aot_load_from_aot_file(const uint8 *buf, uint32 size, const LoadArgs *args,
                        char *error_buf, uint32 error_buf_size)
 {
     AOTModule *module = create_module(args->name, error_buf, error_buf_size);
-#if defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
-    bool prior_jit_protection = os_thread_jit_write_protect_state();
-#else
+    bool use_jit_protection = false;
     bool prior_jit_protection = true;
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+    use_jit_protection = os_thread_jit_write_protect_supported();
+    if (use_jit_protection)
+        prior_jit_protection = os_thread_jit_write_protect_state();
 #endif
 
     if (!module)
@@ -4670,17 +4697,20 @@ aot_load_from_aot_file(const uint8 *buf, uint32 size, const LoadArgs *args,
         aot_unload(module);
         return NULL;
     }
-    os_thread_jit_write_protect_np(false); /* Make memory writable */
+    if (use_jit_protection)
+        os_thread_jit_write_protect_np(false);
     if (!load(buf, size, module, args->wasm_binary_freeable, args->no_resolve,
               error_buf, error_buf_size)
         || module->load_protection_failed
         || (module->load_budget.check
             && !module->load_budget.check(module->load_budget.context))) {
         aot_unload(module);
-        os_thread_jit_write_protect_np(prior_jit_protection);
+        if (use_jit_protection)
+            os_thread_jit_write_protect_np(prior_jit_protection);
         return NULL;
     }
-    os_thread_jit_write_protect_np(prior_jit_protection);
+    if (use_jit_protection)
+        os_thread_jit_write_protect_np(prior_jit_protection);
     os_icache_flush(module->code, module->code_size);
 
 #if WASM_ENABLE_AOT_VALIDATOR != 0
@@ -4690,7 +4720,13 @@ aot_load_from_aot_file(const uint8 *buf, uint32 size, const LoadArgs *args,
     }
 #endif /* WASM_ENABLE_AOT_VALIDATOR != 0 */
 
+    if (module->load_budget.check
+        && !module->load_budget.check(module->load_budget.context)) {
+        aot_unload(module);
+        return NULL;
+    }
     LOG_VERBOSE("Load module success.\n");
+    publish_native_code_policy(module);
     return module;
 }
 
