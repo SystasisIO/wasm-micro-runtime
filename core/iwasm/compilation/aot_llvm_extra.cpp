@@ -67,6 +67,7 @@
 
 #if LLVM_VERSION_MAJOR >= 22
 #include <llvm/ExecutionEngine/JITLink/JITLink.h>
+#include <llvm/ExecutionEngine/Orc/EHFrameRegistrationPlugin.h>
 #include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/SelfExecutorProcessControl.h>
 #include <llvm/ExecutionEngine/Orc/TaskDispatch.h>
@@ -503,6 +504,23 @@ aot_configure_bounded_jit_builder(LLVMOrcLLJITBuilderRef builder,
         config.JTMB->setCodeModel(CodeModel::Large);
         config.JTMB->setRelocationModel(Reloc::PIC_);
         config.JTMB->setCodeGenOptLevel(CodeGenOptLevel::Aggressive);
+#if defined(BH_PLATFORM_DARWIN)
+        /* Independent native mappings need full-width DWARF EH references,
+           not Mach-O compact-unwind's 32-bit image-relative offsets. */
+        config.JTMB->getOptions().MCOptions.EmitDwarfUnwind =
+            EmitDwarfUnwindType::Always;
+        config.setPlatformSetUp([](LLJIT &jit) -> Expected<JITDylibSP> {
+            auto frames = EHFrameRegistrationPlugin::Create(
+                jit.getExecutionSession());
+            if (!frames)
+                return frames.takeError();
+            cast<ObjectLinkingLayer>(jit.getObjLinkingLayer())
+                .addPlugin(std::move(*frames));
+            /* WAMR owns WASM start/initialization. There are no LLVM global
+               constructors to scrape; process-symbol lookup is independent. */
+            return setUpInactivePlatform(jit);
+        });
+#endif
         auto manager = std::unique_ptr<BoundedJitMemory>(new BoundedJitMemory(*budget, native_map_limit));
         auto control = SelfExecutorProcessControl::Create(nullptr,
             std::make_unique<InPlaceTaskDispatcher>(), std::move(manager));
