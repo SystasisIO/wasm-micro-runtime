@@ -32,6 +32,7 @@
 #include "simd/simd_load_store.h"
 #include "simd/simd_sat_int_arith.h"
 #include "../aot/aot_runtime.h"
+#include "../interpreter/wasm_runtime.h"
 #include "../interpreter/wasm_opcode.h"
 #include <errno.h>
 #include <stddef.h>
@@ -1012,13 +1013,12 @@ forge_instrument_call_depth(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
     LLVMTypeRef parameters[2] = { INT8_PTR_TYPE, I32_TYPE };
     LLVMTypeRef signature = LLVMFunctionType(VOID_TYPE, parameters, 2, false);
     LLVMTypeRef result_type = LLVMGetReturnType(LLVMGlobalGetValueType(function));
-    LLVMValueRef setter = LLVMGetNamedFunction(comp_ctx->module, "aot_set_exception_with_id");
+    LLVMTypeRef setter_type;
+    LLVMValueRef setter;
     LLVMValueRef arguments[2];
     LLVMBasicBlockRef block;
     if (!entry || !admitted || !denied)
         return false;
-    if (!setter)
-        setter = LLVMAddFunction(comp_ctx->module, "aot_set_exception_with_id", signature);
     LLVMPositionBuilderAtEnd(comp_ctx->builder, entry);
     /* Keep static locals in the real entry block. Otherwise LLVM treats
        them as dynamic allocas, disables promotion, and the stack-usage
@@ -1052,7 +1052,58 @@ forge_instrument_call_depth(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
     instance = LLVMBuildLoad2(comp_ctx->builder, INT8_PTR_TYPE, module_ptr, "instance");
     arguments[0] = instance;
     arguments[1] = I32_CONST(EXCE_NATIVE_STACK_OVERFLOW);
-    LLVMBuildCall2(comp_ctx->builder, signature, setter, arguments, 2, "");
+    if (comp_ctx->is_jit_mode) {
+        LLVMValueRef address;
+        if (!(setter_type = LLVMPointerType(signature, 0))
+            || !(address =
+                     I64_CONST((uint64)(uintptr_t)jit_set_exception_with_id))
+            || !(setter = LLVMConstIntToPtr(address, setter_type))) {
+            aot_set_last_error("create depth exception function failed.");
+            return false;
+        }
+    }
+    else if (comp_ctx->is_indirect_mode) {
+        LLVMValueRef native_symbol_addr, native_symbol;
+        int32 index =
+            aot_get_native_symbol_index(comp_ctx, "aot_set_exception_with_id");
+        if (index < 0)
+            return false;
+        /* The body has not run: its native_symbol load cannot dominate
+           this guard. Load exec_env->native_symbol here, as in
+           create_native_symbol(), before using the donor table helper. */
+        offset = I32_EIGHT;
+        if (!(native_symbol_addr =
+                  LLVMBuildInBoundsGEP2(comp_ctx->builder, OPQ_PTR_TYPE, env,
+                                        &offset, 1, "depth_native_symbol_addr"))
+            || !(native_symbol = LLVMBuildLoad2(comp_ctx->builder, OPQ_PTR_TYPE,
+                                                native_symbol_addr,
+                                                "depth_native_symbol_tmp"))
+            || !(native_symbol = LLVMBuildBitCast(
+                     comp_ctx->builder, native_symbol, comp_ctx->exec_env_type,
+                     "depth_native_symbol"))
+            || !(setter_type = LLVMPointerType(signature, 0))) {
+            aot_set_last_error("load depth exception native table failed.");
+            return false;
+        }
+        if (!(setter = aot_get_func_from_table(comp_ctx, native_symbol,
+                                               setter_type, index)))
+            return false;
+    }
+    else {
+        if (!(setter = LLVMGetNamedFunction(func_ctx->module,
+                                            "aot_set_exception_with_id"))
+            && !(setter =
+                     LLVMAddFunction(func_ctx->module,
+                                     "aot_set_exception_with_id", signature))) {
+            aot_set_last_error("add depth exception function failed.");
+            return false;
+        }
+    }
+    if (!LLVMBuildCall2(comp_ctx->builder, signature, setter, arguments, 2,
+                        "")) {
+        aot_set_last_error("build depth exception call failed.");
+        return false;
+    }
     if (LLVMGetTypeKind(result_type) == LLVMVoidTypeKind)
         LLVMBuildRetVoid(comp_ctx->builder);
     else
