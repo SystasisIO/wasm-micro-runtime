@@ -340,11 +340,12 @@ bool aot_jit_profile_enable(AOTCompContext *comp_ctx)
 #if LLVM_VERSION_MAJOR >= 22 && WASM_ENABLE_DEBUG_AOT == 0
     if (!comp_ctx || !comp_ctx->is_jit_mode ||
         !comp_ctx->jit_compile_on_caller_thread || !comp_ctx->module ||
+        (!comp_ctx->enable_stack_bound_check && !comp_ctx->enable_stack_estimation) ||
         comp_ctx->jit_instruction_profile || !comp_ctx->func_ctx_count ||
         !comp_ctx->jit_load_budget.check ||
         !comp_ctx->jit_load_budget.allocation_failed) {
         aot_set_last_error(
-            "Instruction profile requires a fresh bounded caller-thread JIT");
+            "Instruction profile requires a fresh bounded caller-thread JIT with stack metadata");
         return false;
     }
     if (!comp_ctx->jit_load_budget.check(comp_ctx->jit_load_budget.context)) {
@@ -369,6 +370,9 @@ bool aot_jit_profile_enable(AOTCompContext *comp_ctx)
     profile->wasm_size = comp_ctx->comp_data->wasm_module->load_size;
     try {
         auto &module = *unwrap(comp_ctx->module);
+        /* The stack-size compiler owns this module's per-compilation codegen
+           policy. Keep exact instruction locations across machine lowering. */
+        module.addModuleFlag(Module::Error, "wamr.jit_instruction_profile", 1);
         module.addModuleFlag(Module::Warning, "Debug Info Version",
                              DEBUG_METADATA_VERSION);
         module.addModuleFlag(Module::Warning, "Dwarf Version", 4);
