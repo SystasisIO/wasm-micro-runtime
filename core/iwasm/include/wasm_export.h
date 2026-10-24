@@ -261,6 +261,25 @@ typedef struct RuntimeInitArgs {
 
 #ifndef LOAD_ARGS_OPTION_DEFINED
 #define LOAD_ARGS_OPTION_DEFINED
+typedef enum WASMBlockTypeMode {
+    WASM_BLOCK_TYPES_STANDARD = 0,
+    WASM_BLOCK_TYPES_NUMERIC = 1,
+    WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO = 2
+} WASMBlockTypeMode;
+
+/* Optional per-load accounting. Context must outlive the loaded module.
+   A zero-initialized record preserves the ordinary upstream load path. */
+typedef struct WASMLoadBudget {
+    void *context;
+    void *(*begin_mapping)(void *context, uint64_t retained, uint64_t peak);
+    void (*complete_mapping)(void *context, void *token, void *address);
+    bool (*unmap)(void *context, void *address, uint64_t retained);
+    bool (*check)(void *context);
+    bool (*before_protect)(void *context);
+    void (*allocation_failed)(void *context);
+    void (*protection_failed)(void *context);
+} WASMLoadBudget;
+
 typedef struct LoadArgs {
     char *name;
     /* This option is only used by the Wasm C API (see wasm_c_api.h) */
@@ -275,6 +294,14 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    /* Standard defaults preserve upstream typed-block semantics. Numeric
+       profiles admit only one-byte numeric/void block types; the legacy mode
+       additionally normalizes a literal zero byte to void in the owned input. */
+    WASMBlockTypeMode block_type_mode;
+    WASMLoadBudget load_budget;
+    /* Keep upstream automatic JIT preparation by default. Explicit preparation
+       callers load only bytecode metadata, then compile after admission. */
+    bool defer_jit;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */
@@ -783,6 +810,20 @@ wasm_runtime_instantiation_args_set_max_memory_pages(
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
                                                 void *custom_data);
+
+/* Defer guest initialization until wasm_runtime_initialize. The caller must
+ * initialize once before calling any guest export and exclusively own the
+ * instance throughout initialization. Failed initialization is not retryable. */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_defer_start(struct InstantiationArgs2 *p,
+                                               bool defer_start);
+
+WASM_RUNTIME_API_EXTERN bool
+wasm_runtime_initialize(wasm_module_inst_t module_inst);
+
+WASM_RUNTIME_API_EXTERN bool
+wasm_runtime_initialize_with_exec_env(wasm_module_inst_t module_inst,
+                                      wasm_exec_env_t exec_env);
 
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_wasi_arg(struct InstantiationArgs2 *p,
@@ -1343,6 +1384,26 @@ wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_exception(wasm_module_inst_t module_inst,
                            const char *exception);
+
+typedef enum WASMExceptionStatus {
+    WASM_EXCEPTION_NONE = 0,
+    WASM_EXCEPTION_UNKNOWN = 1,
+    WASM_EXCEPTION_KNOWN = 2
+} WASMExceptionStatus;
+
+typedef struct WASMExceptionInfo {
+    WASMExceptionStatus status;
+    uint32_t id;
+} WASMExceptionInfo;
+
+/**
+ * Return a synchronized snapshot of the current exception classification.
+ * id is meaningful only for KNOWN and retains the engine's exception ID.
+ * Text-only exceptions are UNKNOWN, including text identical to engine traps.
+ * A fresh instance or a cleared exception is NONE.
+ */
+WASM_RUNTIME_API_EXTERN WASMExceptionInfo
+wasm_runtime_get_exception_info(wasm_module_inst_t module_inst);
 
 /**
  * Clear exception info of the WASM module instance.

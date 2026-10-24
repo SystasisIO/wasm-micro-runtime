@@ -2282,6 +2282,14 @@ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
     }
 
 #if WASM_ENABLE_WASM_CACHE != 0
+    /* A binary-only cache key cannot preserve a caller's admission policy. */
+    if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD || args->defer_jit
+        || args->load_budget.context || args->load_budget.begin_mapping
+        || args->load_budget.complete_mapping || args->load_budget.unmap
+        || args->load_budget.check || args->load_budget.before_protect
+        || args->load_budget.allocation_failed
+        || args->load_budget.protection_failed)
+        goto quit;
     /* if cached */
     SHA256((void *)binary->data, binary->num_elems, (uint8_t *)binary_hash);
     module_ex = try_reuse_loaded_module(store, binary_hash);
@@ -2752,8 +2760,8 @@ wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
         }
 
         /* byte* -> wasm_byte_vec_t */
-        wasm_name_new_from_string_nt(&name, export->name);
-        if (strlen(export->name) && !name.data) {
+        wasm_name_new(&name, export->name_len, export->name);
+        if (export->name_len && !name.data) {
             goto failed;
         }
 
@@ -4840,8 +4848,8 @@ aot_process_export(wasm_store_t *store, const AOTModuleInstance *inst_aot,
             goto failed;
         }
 
-        wasm_name_new_from_string_nt(external->name, export->name);
-        if (strlen(export->name) && !external->name->data) {
+        wasm_name_new(external->name, export->name_len, export->name);
+        if (export->name_len && !external->name->data) {
             goto failed;
         }
 

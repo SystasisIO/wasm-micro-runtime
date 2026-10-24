@@ -1167,7 +1167,7 @@ wasm_runtime_validate_app_addr(WASMModuleInstanceCommon *module_inst_comm,
     SHARED_MEMORY_UNLOCK(memory_inst);
 
 fail:
-    wasm_set_exception(module_inst, "out of bounds memory access");
+    wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
     return false;
 }
 
@@ -1234,7 +1234,7 @@ wasm_runtime_validate_app_str_addr(WASMModuleInstanceCommon *module_inst_comm,
 
     return true;
 fail:
-    wasm_set_exception(module_inst, "out of bounds memory access");
+    wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
     return false;
 }
 
@@ -1286,7 +1286,7 @@ wasm_runtime_validate_native_addr(WASMModuleInstanceCommon *module_inst_comm,
     SHARED_MEMORY_UNLOCK(memory_inst);
 
 fail:
-    wasm_set_exception(module_inst, "out of bounds memory access");
+    wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
     return false;
 }
 
@@ -1470,7 +1470,7 @@ wasm_check_app_addr_and_convert(WASMModuleInstance *module_inst, bool is_str,
     bh_assert(app_buf_addr <= UINTPTR_MAX && app_buf_size <= UINTPTR_MAX);
 
     if (!memory_inst) {
-        wasm_set_exception(module_inst, "out of bounds memory access");
+        wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
         return false;
     }
 
@@ -1492,7 +1492,7 @@ wasm_check_app_addr_and_convert(WASMModuleInstance *module_inst, bool is_str,
         while (str < str_end && *str != '\0')
             str++;
         if (str == str_end) {
-            wasm_set_exception(module_inst, "out of bounds memory access");
+            wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
             return false;
         }
         else
@@ -1547,7 +1547,7 @@ success:
 #ifndef OS_ENABLE_HW_BOUND_CHECK
 fail:
     SHARED_MEMORY_UNLOCK(memory_inst);
-    wasm_set_exception(module_inst, "out of bounds memory access");
+    wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
     return false;
 #endif
 }

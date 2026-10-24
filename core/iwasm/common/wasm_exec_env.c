@@ -68,6 +68,7 @@ wasm_exec_env_create_internal(struct WASMModuleInstanceCommon *module_inst,
 
     exec_env->module_inst = module_inst;
     exec_env->wasm_stack_size = stack_size;
+    exec_env->forge_max_call_depth = UINT32_MAX;
     exec_env->wasm_stack.bottom = exec_env->wasm_stack_u.bottom;
     exec_env->wasm_stack.top_boundary =
         exec_env->wasm_stack.bottom + stack_size;
@@ -247,6 +248,7 @@ wasm_exec_env_restore_module_inst(
         (WASMModuleInstance *)old_module_inst_common;
     WASMModuleInstance *module_inst = (WASMModuleInstance *)module_inst_common;
     char cur_exception[EXCEPTION_BUF_LEN];
+    WASMExceptionInfo exception_info;
 
 #if WASM_ENABLE_THREAD_MGR != 0
     wasm_cluster_traverse_lock(exec_env);
@@ -260,6 +262,8 @@ wasm_exec_env_restore_module_inst(
         bh_memcpy_s(cur_exception, sizeof(cur_exception),
                     old_module_inst->cur_exception,
                     sizeof(old_module_inst->cur_exception));
+        exception_info =
+            GetModuleInstanceExtraCommon(old_module_inst)->exception_info;
     }
     else {
         cur_exception[0] = '\0';
@@ -269,11 +273,7 @@ wasm_exec_env_restore_module_inst(
     wasm_cluster_traverse_unlock(exec_env);
 #endif
     if (cur_exception[0] != '\0') {
-        exception_lock(module_inst);
-        bh_memcpy_s(module_inst->cur_exception,
-                    sizeof(module_inst->cur_exception), cur_exception,
-                    sizeof(cur_exception));
-        exception_unlock(module_inst);
+        wasm_set_exception_local(module_inst, cur_exception, exception_info);
     }
 }
 

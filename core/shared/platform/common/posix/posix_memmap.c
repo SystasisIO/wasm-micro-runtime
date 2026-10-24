@@ -37,6 +37,34 @@ round_down(uintptr_t v, uintptr_t b)
 }
 #endif
 
+bool
+os_mmap_sizes(size_t size, int flags, size_t *retained, size_t *peak)
+{
+    uint64 page_size = (uint64)getpagesize();
+    uint64 rounded, request_size;
+    if (!size || !page_size || (uint64)size > UINT64_MAX - (page_size - 1))
+        return false;
+    rounded = ((uint64)size + page_size - 1) & ~(page_size - 1);
+    request_size = rounded;
+#if !defined(__APPLE__) && !defined(__NuttX__) && defined(MADV_HUGEPAGE)
+    if (!(flags & MMAP_MAP_NO_HUGE) && request_size >= HUGE_PAGE_SIZE) {
+        if (request_size > UINT64_MAX - HUGE_PAGE_SIZE)
+            return false;
+        request_size += HUGE_PAGE_SIZE;
+    }
+#endif
+    (void)flags;
+    if (request_size > SIZE_MAX)
+        return false;
+#if WASM_ENABLE_MEMORY64 == 0
+    if (request_size > 16 * (uint64)UINT32_MAX)
+        return false;
+#endif
+    *retained = (size_t)rounded;
+    *peak = (size_t)request_size;
+    return true;
+}
+
 void *
 os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 {
@@ -47,24 +75,22 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 #else
     int map_flags = MAP_ANONYMOUS | MAP_PRIVATE;
 #endif
-    uint64 request_size, page_size;
+    uint64 request_size;
+    size_t retained_size, peak_size;
     uint8 *addr = MAP_FAILED;
     uint32 i;
 
-    page_size = (uint64)getpagesize();
-    request_size = (size + page_size - 1) & ~(page_size - 1);
-
-#if !defined(__APPLE__) && !defined(__NuttX__) && defined(MADV_HUGEPAGE)
-    /* huge page isn't supported on MacOS and NuttX */
-    if (request_size >= HUGE_PAGE_SIZE)
-        /* apply one extra huge page */
-        request_size += HUGE_PAGE_SIZE;
+#if (defined(__APPLE__) || defined(__MACH__)) && defined(__arm64__) \
+    && defined(TARGET_OS_OSX) && TARGET_OS_OSX != 0
+    if (flags & MMAP_MAP_NO_JIT)
+        map_flags &= ~MAP_JIT;
 #endif
 
-    if ((size_t)request_size < size) {
+    if (!os_mmap_sizes(size, flags, &retained_size, &peak_size)) {
         os_printf("mmap failed: request size overflow due to paging\n");
         return NULL;
     }
+    request_size = peak_size;
 
 #if WASM_ENABLE_MEMORY64 == 0
     if (request_size > 16 * (uint64)UINT32_MAX) {
@@ -171,7 +197,7 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 
 #if !defined(__APPLE__) && !defined(__NuttX__) && defined(MADV_HUGEPAGE)
     /* huge page isn't supported on MacOS and NuttX */
-    if (request_size > HUGE_PAGE_SIZE) {
+    if (!(flags & MMAP_MAP_NO_HUGE) && request_size > HUGE_PAGE_SIZE) {
         uintptr_t huge_start, huge_end;
         size_t prefix_size = 0, suffix_size = HUGE_PAGE_SIZE;
 
@@ -226,8 +252,8 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
     return addr;
 }
 
-void
-os_munmap(void *addr, size_t size)
+int
+os_munmap_checked(void *addr, size_t size)
 {
     uint64 page_size = (uint64)getpagesize();
     uint64 request_size = (size + page_size - 1) & ~(page_size - 1);
@@ -236,7 +262,7 @@ os_munmap(void *addr, size_t size)
         if (munmap(addr, request_size)) {
             os_printf("os_munmap error addr:%p, size:0x%" PRIx64 ", errno:%d\n",
                       addr, request_size, errno);
-            return;
+            return -1;
         }
 #if BH_ENABLE_TRACE_MMAP != 0
         total_size_munmapped += request_size;
@@ -245,6 +271,13 @@ os_munmap(void *addr, size_t size)
                   addr, request_size, total_size_mmapped, total_size_munmapped);
 #endif
     }
+    return 0;
+}
+
+void
+os_munmap(void *addr, size_t size)
+{
+    (void)os_munmap_checked(addr, size);
 }
 
 #if WASM_HAVE_MREMAP != 0

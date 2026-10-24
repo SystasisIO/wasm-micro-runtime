@@ -408,6 +408,10 @@ typedef struct AOTCompContext {
     LLVMModuleRef module;
 
     bool is_jit_mode;
+    bool jit_compile_on_caller_thread;
+    WASMLoadBudget jit_load_budget;
+    uint64 jit_native_map_limit;
+    uint32 *jit_pending_stack_sizes;
 
     /* AOT indirect mode flag & symbol list */
     bool is_indirect_mode;
@@ -554,6 +558,7 @@ typedef struct AOTCompContext {
 
     /* Current frame information for translation */
     AOTCompFrame *aot_frame;
+    struct AOTJitProfile *jit_instruction_profile;
 } AOTCompContext;
 
 enum {
@@ -654,7 +659,7 @@ aot_load_const_from_table(AOTCompContext *comp_ctx, LLVMValueRef base,
 bool
 aot_check_simd_compatibility(LLVMTargetMachineRef target_machine);
 
-void
+bool
 aot_apply_llvm_new_pass_manager(AOTCompContext *comp_ctx, LLVMModuleRef module);
 
 void

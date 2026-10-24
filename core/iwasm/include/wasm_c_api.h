@@ -528,6 +528,24 @@ typedef struct WASMModuleCommon *wasm_module_t;
 
 #ifndef LOAD_ARGS_OPTION_DEFINED
 #define LOAD_ARGS_OPTION_DEFINED
+typedef enum WASMBlockTypeMode {
+    WASM_BLOCK_TYPES_STANDARD = 0,
+    WASM_BLOCK_TYPES_NUMERIC = 1,
+    WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO = 2
+} WASMBlockTypeMode;
+
+/* Keep this record and LoadArgs synchronized with wasm_export.h. */
+typedef struct WASMLoadBudget {
+    void *context;
+    void *(*begin_mapping)(void *context, uint64_t retained, uint64_t peak);
+    void (*complete_mapping)(void *context, void *token, void *address);
+    bool (*unmap)(void *context, void *address, uint64_t retained);
+    bool (*check)(void *context);
+    bool (*before_protect)(void *context);
+    void (*allocation_failed)(void *context);
+    void (*protection_failed)(void *context);
+} WASMLoadBudget;
+
 typedef struct LoadArgs {
     char *name;
     /* True by default, used by wasm-c-api only.
@@ -540,6 +558,13 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    /* Keep this layout synchronized with wasm_export.h. Nonstandard block
+       modes are not supported by the C API's WASM-only module cache. */
+    WASMBlockTypeMode block_type_mode;
+    WASMLoadBudget load_budget;
+    /* Keep in sync with wasm_export.h. A binary-only cache cannot preserve
+       this caller-selected compilation policy. */
+    bool defer_jit;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */

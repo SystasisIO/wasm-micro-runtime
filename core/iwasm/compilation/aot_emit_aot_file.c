@@ -883,7 +883,7 @@ get_export_size(AOTCompContext *comp_ctx, AOTExport *export)
 {
     /* export index + export kind + 1 byte padding + export name */
     return (uint32)sizeof(uint32) + sizeof(uint8) + 1
-           + get_string_size(comp_ctx, export->name);
+           + (uint32)sizeof(uint16) + export->name_len + 1;
 }
 
 static uint32
@@ -2725,7 +2725,12 @@ aot_emit_export_section(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
         EMIT_U32(export->index);
         EMIT_U8(export->kind);
         EMIT_U8(0);
-        EMIT_STR(export->name);
+        if ((uint64)export->name_len + 1 > INT16_MAX) {
+            aot_set_last_error("emit export name failed: string too long");
+            return false;
+        }
+        EMIT_U16(export->name_len + 1);
+        EMIT_BUF(export->name, export->name_len + 1);
     }
 
     if (offset - *p_offset != section_size + sizeof(uint32) * 2) {
@@ -3480,6 +3485,8 @@ read_stack_usage_file(const AOTCompContext *comp_ctx, const char *filename,
         char *colon;
         uintmax_t func_idx;
         uintmax_t sz;
+        char usage[16];
+        char trailing;
         int ret;
 
         if (cp == NULL) {
@@ -3505,8 +3512,10 @@ read_stack_usage_file(const AOTCompContext *comp_ctx, const char *filename,
             }
             prefix = aot_func_internal_prefix;
         }
-        ret = sscanf(fn + strlen(prefix), "%ju %ju static", &func_idx, &sz);
-        if (ret != 2) {
+        ret = sscanf(fn + strlen(prefix), "%ju %ju %15s %c", &func_idx,
+                     &sz, usage, &trailing);
+        if (ret != 3 || strcmp(usage, "static")) {
+            aot_set_last_error("unsupported native stack usage");
             goto fail;
         }
         if (sz > UINT32_MAX) {

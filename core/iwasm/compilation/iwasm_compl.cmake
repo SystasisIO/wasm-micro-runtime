@@ -15,6 +15,17 @@ else()
                     ${IWASM_COMPL_DIR}/*.cpp)
 endif()
 
+# Keep the instruction-profile implementation in the existing compiler target,
+# including non-profiling JIT/AOT builds. Do not add replacement object libraries
+# or compile these translation units twice when the glob also discovers them.
+set (instruction_profile_sources
+     ${IWASM_COMPL_DIR}/aot_compiler.c
+     ${IWASM_COMPL_DIR}/aot_llvm.c
+     ${IWASM_COMPL_DIR}/aot_jit_profile.cpp)
+list (REMOVE_ITEM source_all ${instruction_profile_sources})
+list (APPEND source_all ${instruction_profile_sources})
+list (REMOVE_DUPLICATES source_all)
+
 set (IWASM_COMPL_SOURCE ${source_all})
 
 # Disable rtti to works with LLVM

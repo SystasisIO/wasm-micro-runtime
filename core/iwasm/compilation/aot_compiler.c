@@ -4,6 +4,7 @@
  */
 
 #include "aot_compiler.h"
+#include "aot_jit_profile.h"
 #include "aot_emit_compare.h"
 #include "aot_emit_conversion.h"
 #include "aot_emit_memory.h"
@@ -31,8 +32,10 @@
 #include "simd/simd_load_store.h"
 #include "simd/simd_sat_int_arith.h"
 #include "../aot/aot_runtime.h"
+#include "../interpreter/wasm_runtime.h"
 #include "../interpreter/wasm_opcode.h"
 #include <errno.h>
+#include <stddef.h>
 
 #if WASM_ENABLE_DEBUG_AOT != 0
 #include "debug/dwarf_extractor.h"
@@ -996,6 +999,126 @@ init_comp_frame(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 }
 
 static bool
+forge_instrument_call_depth(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
+{
+    /* Count logical WASM frames, independent of LLVM inlining, native stack
+       layout and return path. The incoming value dominates every return. */
+    LLVMValueRef function = func_ctx->func;
+    LLVMValueRef env = LLVMGetParam(function, 0);
+    LLVMBasicBlockRef body = LLVMGetEntryBasicBlock(function);
+    LLVMBasicBlockRef entry = LLVMInsertBasicBlockInContext(comp_ctx->context, body, "forge_depth_entry");
+    LLVMBasicBlockRef admitted = LLVMAppendBasicBlockInContext(comp_ctx->context, function, "forge_depth_admitted");
+    LLVMBasicBlockRef denied = LLVMAppendBasicBlockInContext(comp_ctx->context, function, "forge_depth_denied");
+    LLVMValueRef offset, depth_ptr, maximum_ptr, failed_ptr, depth, maximum, condition, module_ptr, instance;
+    LLVMTypeRef parameters[2] = { INT8_PTR_TYPE, I32_TYPE };
+    LLVMTypeRef signature = LLVMFunctionType(VOID_TYPE, parameters, 2, false);
+    LLVMTypeRef result_type = LLVMGetReturnType(LLVMGlobalGetValueType(function));
+    LLVMTypeRef setter_type;
+    LLVMValueRef setter;
+    LLVMValueRef arguments[2];
+    LLVMBasicBlockRef block;
+    if (!entry || !admitted || !denied)
+        return false;
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, entry);
+    /* Keep static locals in the real entry block. Otherwise LLVM treats
+       them as dynamic allocas, disables promotion, and the stack-usage
+       report omits their additional native allocation. */
+    for (LLVMValueRef instruction = LLVMGetFirstInstruction(body), next;
+         instruction; instruction = next) {
+        next = LLVMGetNextInstruction(instruction);
+        if (LLVMIsAAllocaInst(instruction)
+            && LLVMIsAConstantInt(LLVMGetOperand(instruction, 0))) {
+            LLVMInstructionRemoveFromParent(instruction);
+            LLVMInsertIntoBuilder(comp_ctx->builder, instruction);
+        }
+    }
+    offset = I32_CONST(offsetof(WASMExecEnv, forge_call_depth));
+    depth_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "depth_ptr");
+    offset = I32_CONST(offsetof(WASMExecEnv, forge_max_call_depth));
+    maximum_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "maximum_ptr");
+    offset = I32_CONST(offsetof(WASMExecEnv, forge_depth_exceeded));
+    failed_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "depth_failure_ptr");
+    depth = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE, depth_ptr, "incoming_depth");
+    maximum = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE, maximum_ptr, "maximum_depth");
+    condition = LLVMBuildICmp(comp_ctx->builder, LLVMIntULT, depth, maximum, "depth_admitted");
+    LLVMBuildCondBr(comp_ctx->builder, condition, admitted, denied);
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, admitted);
+    LLVMBuildStore(comp_ctx->builder, LLVMBuildAdd(comp_ctx->builder, depth, I32_ONE, "next_depth"), depth_ptr);
+    LLVMBuildBr(comp_ctx->builder, body);
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, denied);
+    LLVMBuildStore(comp_ctx->builder, I32_ONE, failed_ptr);
+    offset = I32_CONST(offsetof(WASMExecEnv, module_inst));
+    module_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE, env, &offset, 1, "module_ptr");
+    instance = LLVMBuildLoad2(comp_ctx->builder, INT8_PTR_TYPE, module_ptr, "instance");
+    arguments[0] = instance;
+    arguments[1] = I32_CONST(EXCE_NATIVE_STACK_OVERFLOW);
+    if (comp_ctx->is_jit_mode) {
+        LLVMValueRef address;
+        if (!(setter_type = LLVMPointerType(signature, 0))
+            || !(address =
+                     I64_CONST((uint64)(uintptr_t)jit_set_exception_with_id))
+            || !(setter = LLVMConstIntToPtr(address, setter_type))) {
+            aot_set_last_error("create depth exception function failed.");
+            return false;
+        }
+    }
+    else if (comp_ctx->is_indirect_mode) {
+        LLVMValueRef native_symbol_addr, native_symbol;
+        int32 index =
+            aot_get_native_symbol_index(comp_ctx, "aot_set_exception_with_id");
+        if (index < 0)
+            return false;
+        /* The body has not run: its native_symbol load cannot dominate
+           this guard. Load exec_env->native_symbol here, as in
+           create_native_symbol(), before using the donor table helper. */
+        offset = I32_EIGHT;
+        if (!(native_symbol_addr =
+                  LLVMBuildInBoundsGEP2(comp_ctx->builder, OPQ_PTR_TYPE, env,
+                                        &offset, 1, "depth_native_symbol_addr"))
+            || !(native_symbol = LLVMBuildLoad2(comp_ctx->builder, OPQ_PTR_TYPE,
+                                                native_symbol_addr,
+                                                "depth_native_symbol_tmp"))
+            || !(native_symbol = LLVMBuildBitCast(
+                     comp_ctx->builder, native_symbol, comp_ctx->exec_env_type,
+                     "depth_native_symbol"))
+            || !(setter_type = LLVMPointerType(signature, 0))) {
+            aot_set_last_error("load depth exception native table failed.");
+            return false;
+        }
+        if (!(setter = aot_get_func_from_table(comp_ctx, native_symbol,
+                                               setter_type, index)))
+            return false;
+    }
+    else {
+        if (!(setter = LLVMGetNamedFunction(func_ctx->module,
+                                            "aot_set_exception_with_id"))
+            && !(setter =
+                     LLVMAddFunction(func_ctx->module,
+                                     "aot_set_exception_with_id", signature))) {
+            aot_set_last_error("add depth exception function failed.");
+            return false;
+        }
+    }
+    if (!LLVMBuildCall2(comp_ctx->builder, signature, setter, arguments, 2,
+                        "")) {
+        aot_set_last_error("build depth exception call failed.");
+        return false;
+    }
+    if (LLVMGetTypeKind(result_type) == LLVMVoidTypeKind)
+        LLVMBuildRetVoid(comp_ctx->builder);
+    else
+        LLVMBuildRet(comp_ctx->builder, LLVMConstNull(result_type));
+    for (block = LLVMGetFirstBasicBlock(function); block; block = LLVMGetNextBasicBlock(block)) {
+        LLVMValueRef end = LLVMGetBasicBlockTerminator(block);
+        if (end && LLVMIsAReturnInst(end)) {
+            LLVMPositionBuilderBefore(comp_ctx->builder, end);
+            LLVMBuildStore(comp_ctx->builder, depth, depth_ptr);
+        }
+    }
+    return true;
+}
+
+static bool
 aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
 {
     AOTFuncContext *func_ctx = comp_ctx->func_ctxes[func_index];
@@ -1022,6 +1145,10 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
     LLVMMetadataRef location;
 #endif
 
+    if (comp_ctx->jit_instruction_profile
+        && !aot_jit_profile_location(comp_ctx, func_ctx, NULL))
+        return false;
+
     /* Start to translate the opcodes */
     LLVMPositionBuilderAtEnd(
         comp_ctx->builder,
@@ -1045,6 +1172,10 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
 
     while (frame_ip < frame_ip_end) {
         opcode = *frame_ip++;
+
+        if (comp_ctx->jit_instruction_profile
+            && !aot_jit_profile_location(comp_ctx, func_ctx, frame_ip - 1))
+            return false;
 
         if (comp_ctx->aot_frame) {
             comp_ctx->aot_frame->frame_ip = frame_ip - 1;
@@ -3936,6 +4067,13 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
         }
     }
 
+    if (comp_ctx->jit_instruction_profile
+        && !aot_jit_profile_location(comp_ctx, func_ctx, NULL))
+        return false;
+
+    if (!forge_instrument_call_depth(comp_ctx, func_ctx))
+        return false;
+
     /* Move func_return block to the bottom */
     if (func_ctx->func_return_block) {
         LLVMBasicBlockRef last_block = LLVMGetLastBasicBlock(func_ctx->func);
@@ -4029,6 +4167,11 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 
     bh_print_time("Begin to compile WASM bytecode to LLVM IR");
     for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        if (comp_ctx->jit_compile_on_caller_thread
+            && !comp_ctx->jit_load_budget.check(comp_ctx->jit_load_budget.context)) {
+            aot_set_last_error("bounded JIT preparation canceled or unavailable");
+            return false;
+        }
         if (!aot_compile_func(comp_ctx, i)) {
             return false;
         }
@@ -4037,6 +4180,9 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 #if WASM_ENABLE_DEBUG_AOT != 0
     LLVMDIBuilderFinalize(comp_ctx->debug_builder);
 #endif
+
+    if (!aot_jit_profile_finalize(comp_ctx))
+        return false;
 
     /* Disable LLVM module verification for jit mode to speedup
        the compilation process */
@@ -4056,7 +4202,8 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
            JIT: one is memory leak in do_ir_transform, the other is
            possible core dump. */
         bh_print_time("Begin to run llvm optimization passes");
-        aot_apply_llvm_new_pass_manager(comp_ctx, comp_ctx->module);
+        if (!aot_apply_llvm_new_pass_manager(comp_ctx, comp_ctx->module))
+            return false;
         bh_print_time("Finish llvm optimization passes");
     }
 
@@ -4086,10 +4233,7 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 
         if ((err = LLVMOrcLLLazyJITAddLLVMIRModule(
                  comp_ctx->orc_jit, orc_main_dylib, orc_thread_safe_module))) {
-            /* If adding the ThreadSafeModule fails then we need to clean it up
-               by ourselves, otherwise the orc orc_jit will manage the memory.
-             */
-            LLVMOrcDisposeThreadSafeModule(orc_thread_safe_module);
+            /* The wrapper consumes the thread-safe module on both paths. */
             aot_handle_llvm_errmsg("failed to addIRModule", err);
             return false;
         }
@@ -4102,6 +4246,21 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
                 return false;
             }
             comp_ctx->jit_stack_sizes = (uint32 *)addr;
+            if (comp_ctx->jit_compile_on_caller_thread) {
+                if (!comp_ctx->jit_pending_stack_sizes) {
+                    aot_set_last_error("bounded JIT stack measurements are absent");
+                    return false;
+                }
+                for (i = 0; i < comp_ctx->func_ctx_count; ++i) {
+                    if (comp_ctx->jit_pending_stack_sizes[i] == UINT32_MAX) {
+                        aot_set_last_error("bounded JIT stack measurements are incomplete");
+                        return false;
+                    }
+                    comp_ctx->jit_stack_sizes[i] = comp_ctx->jit_pending_stack_sizes[i];
+                }
+                wasm_runtime_free(comp_ctx->jit_pending_stack_sizes);
+                comp_ctx->jit_pending_stack_sizes = NULL;
+            }
         }
     }
 

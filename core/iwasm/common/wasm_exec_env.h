@@ -33,6 +33,12 @@ typedef struct WASMJmpBuf {
 } WASMJmpBuf;
 #endif
 
+typedef enum WASMFPFailure {
+    WASM_FP_FAILURE_NONE = 0,
+    WASM_FP_FAILURE_ENTER_FAILED = 1,
+    WASM_FP_FAILURE_RESTORE_FAILED = 2
+} WASMFPFailure;
+
 /* Execution environment */
 typedef struct WASMExecEnv {
     /* Next thread's exec env of a WASM module instance. */
@@ -86,6 +92,11 @@ typedef struct WASMExecEnv {
         /* The bottom of the wasm stack. */
         uint8 *bottom;
     } wasm_stack;
+
+    /* Shared fixed-layout prefix used by Forge's interpreter and AOT profile. */
+    uint32 forge_call_depth;
+    uint32 forge_max_call_depth;
+    uint32 forge_depth_exceeded;
 
 #if WASM_ENABLE_INSTRUCTION_METERING != 0
     /* instructions to execute */
@@ -164,6 +175,10 @@ typedef struct WASMExecEnv {
 
     /* The WASM stack size */
     uint32 wasm_stack_size;
+
+    /* First FP guard failure; only the embedder's outer operation clears it.
+       Keep this after all existing scalar fields, outside the AOT prefix. */
+    WASMFPFailure forge_fp_failure;
 
     /* The WASM stack of current thread */
     union {

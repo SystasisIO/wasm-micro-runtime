@@ -12,6 +12,9 @@
 extern "C" {
 #endif
 
+LLVMValueRef
+aot_canonicalize_nan(AOTCompContext *comp_ctx, LLVMValueRef value, bool is_f32);
+
 bool
 aot_compile_op_i32_clz(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 

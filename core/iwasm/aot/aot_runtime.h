@@ -97,6 +97,7 @@ typedef struct AOTRelocationGroup {
 /* AOT function instance */
 typedef struct AOTFunctionInstance {
     char *func_name;
+    uint32 func_name_len;
     uint32 func_index;
     bool is_import_func;
     union {
@@ -349,6 +350,10 @@ typedef struct AOTModule {
     /* Whether the underlying wasm binary buffer can be freed */
     bool is_binary_freeable;
 
+    WASMLoadBudget load_budget;
+    bool load_protection_failed;
+    bool load_jit_code;
+
     /* `.data` sections merged into one mmaped to reduce the tlb cache miss */
     uint8 *merged_data_sections;
     uint32 merged_data_sections_size;
@@ -359,6 +364,11 @@ typedef struct AOTModule {
 #if WASM_ENABLE_AOT_STACK_FRAME != 0
     uint32 feature_flags;
 #endif
+
+    /* Loader-owned text and its checked final executable protection. */
+    bool load_code_owned;
+    bool load_code_committed;
+    WASMNativeCodePolicy native_code_policy;
 } AOTModule;
 
 #define AOTMemoryInstance WASMMemoryInstance
@@ -562,6 +572,9 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
  * @param module_inst the AOT module instance to destroy
  * @param is_sub_inst the flag of sub instance
  */
+bool
+aot_initialize(AOTModuleInstance *module_inst, WASMExecEnv *exec_env);
+
 void
 aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst);
 

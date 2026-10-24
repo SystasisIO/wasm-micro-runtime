@@ -93,6 +93,13 @@ os_thread_get_stack_boundary(void);
  */
 void
 os_thread_jit_write_protect_np(bool enabled);
+#if defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
+/* State established through the WAMR wrapper; external pthread writes bypass it. */
+bool
+os_thread_jit_write_protect_state(void);
+bool
+os_thread_jit_write_protect_supported(void);
+#endif
 
 /**
  ************** mutext APIs ***********
@@ -133,10 +140,21 @@ enum {
     /* Don't interpret addr as a hint: place the mapping at exactly
        that address. */
     MMAP_MAP_FIXED = 2,
+    /* Keep one owned extent; skip optional huge-page alignment overmapping. */
+    MMAP_MAP_NO_HUGE = 4,
+    /* Offline native loading uses checked RW -> RX, not a JIT write window. */
+    MMAP_MAP_NO_JIT = 8,
 };
 
 void *
 os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file);
+#if defined(BH_PLATFORM_LINUX) || defined(BH_PLATFORM_DARWIN)
+/* Same size calculation used by os_mmap, including temporary alignment space. */
+bool
+os_mmap_sizes(size_t size, int flags, size_t *retained, size_t *peak);
+int
+os_munmap_checked(void *addr, size_t size);
+#endif
 void
 os_munmap(void *addr, size_t size);
 int

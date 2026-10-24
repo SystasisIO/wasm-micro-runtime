@@ -12,6 +12,46 @@
 #include <llvm-c/Core.h>
 #include <llvm-c/Support.h>
 
+/* Runtime allocator callbacks may prepend usage and user-data arguments. */
+static void *
+compiler_malloc(
+#if WASM_MEM_ALLOC_WITH_USAGE != 0
+    mem_alloc_usage_t usage,
+#endif
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    void *user_data,
+#endif
+    unsigned int size)
+{
+    return malloc(size);
+}
+
+static void *
+compiler_realloc(
+#if WASM_MEM_ALLOC_WITH_USAGE != 0
+    mem_alloc_usage_t usage, bool full_size_mmaped,
+#endif
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    void *user_data,
+#endif
+    void *ptr, unsigned int size)
+{
+    return realloc(ptr, size);
+}
+
+static void
+compiler_free(
+#if WASM_MEM_ALLOC_WITH_USAGE != 0
+    mem_alloc_usage_t usage,
+#endif
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    void *user_data,
+#endif
+    void *ptr)
+{
+    free(ptr);
+}
+
 #if BH_HAS_DLFCN
 #include <dlfcn.h>
 
@@ -790,9 +830,9 @@ main(int argc, char *argv[])
     memset(&init_args, 0, sizeof(RuntimeInitArgs));
 
     init_args.mem_alloc_type = Alloc_With_Allocator;
-    init_args.mem_alloc_option.allocator.malloc_func = malloc;
-    init_args.mem_alloc_option.allocator.realloc_func = realloc;
-    init_args.mem_alloc_option.allocator.free_func = free;
+    init_args.mem_alloc_option.allocator.malloc_func = compiler_malloc;
+    init_args.mem_alloc_option.allocator.realloc_func = compiler_realloc;
+    init_args.mem_alloc_option.allocator.free_func = compiler_free;
 #if WASM_ENABLE_LINUX_PERF != 0
     init_args.enable_linux_perf = enable_linux_perf;
 #endif

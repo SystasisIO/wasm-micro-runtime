@@ -10,6 +10,7 @@
 #include "wasm_loader.h"
 #include "wasm_memory.h"
 #include "../common/wasm_exec_env.h"
+#include "../common/wasm_canonical_nan.h"
 #if WASM_ENABLE_GC != 0
 #include "../common/gc/gc_object.h"
 #include "mem_alloc.h"
@@ -719,6 +720,21 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
         frame_ip += 4;                                                        \
     } while (0)
 
+#define DEF_OP_FP_NUMERIC(type, kind, op) \
+    do { \
+        type right = GET_OPERAND(type, kind, 0); \
+        type left = GET_OPERAND(type, kind, 2); \
+        SET_OPERAND(kind, 4, wasm_canonical_##kind(left op right)); \
+        frame_ip += 6; \
+    } while (0)
+
+#define DEF_OP_FP_MATH(type, kind, method) \
+    do { \
+        type value = GET_OPERAND(type, kind, 0); \
+        SET_OPERAND(kind, 2, wasm_canonical_##kind(method(value))); \
+        frame_ip += 4; \
+    } while (0)
+
 #define TRUNC_FUNCTION(func_name, src_type, dst_type, signed_type)  \
     static dst_type func_name(src_type src_value, src_type src_min, \
                               src_type src_max, dst_type dst_min,   \
@@ -756,11 +772,11 @@ trunc_f32_to_int(WASMModuleInstance *module, uint8 *frame_ip, uint32 *frame_lp,
 
     if (!saturating) {
         if (isnan(src_value)) {
-            wasm_set_exception(module, "invalid conversion to integer");
+            wasm_set_exception_with_id(module, EXCE_INVALID_CONVERSION_TO_INTEGER);
             return false;
         }
         else if (src_value <= src_min || src_value >= src_max) {
-            wasm_set_exception(module, "integer overflow");
+            wasm_set_exception_with_id(module, EXCE_INTEGER_OVERFLOW);
             return false;
         }
     }
@@ -793,11 +809,11 @@ trunc_f64_to_int(WASMModuleInstance *module, uint8 *frame_ip, uint32 *frame_lp,
 
     if (!saturating) {
         if (isnan(src_value)) {
-            wasm_set_exception(module, "invalid conversion to integer");
+            wasm_set_exception_with_id(module, EXCE_INVALID_CONVERSION_TO_INTEGER);
             return false;
         }
         else if (src_value <= src_min || src_value >= src_max) {
-            wasm_set_exception(module, "integer overflow");
+            wasm_set_exception_with_id(module, EXCE_INTEGER_OVERFLOW);
             return false;
         }
     }
@@ -889,7 +905,7 @@ copy_stack_values(WASMModuleInstance *module, uint32 *frame_lp, uint32 arity,
         uint64 total_size = sizeof(uint32) * (uint64)total_cell_num;
         if (total_size >= UINT32_MAX
             || !(tmp_buf = wasm_runtime_malloc((uint32)total_size))) {
-            wasm_set_exception(module, "allocate memory failed");
+            wasm_set_exception_with_id(module, EXCE_OUT_OF_MEMORY);
             goto fail;
         }
     }
@@ -899,7 +915,7 @@ copy_stack_values(WASMModuleInstance *module, uint32 *frame_lp, uint32 arity,
         uint64 total_size = sizeof(uint8) * (uint64)total_cell_num;
         if (total_size >= UINT32_MAX
             || !(tmp_ref_buf = wasm_runtime_malloc((uint32)total_size))) {
-            wasm_set_exception(module, "allocate memory failed");
+            wasm_set_exception_with_id(module, EXCE_OUT_OF_MEMORY);
             goto fail;
         }
     }
@@ -1163,8 +1179,7 @@ ALLOC_FRAME(WASMExecEnv *exec_env, uint32 size, WASMInterpFrame *prev_frame)
 #endif
     }
     else {
-        wasm_set_exception((WASMModuleInstance *)exec_env->module_inst,
-                           "wasm operand stack overflow");
+        wasm_set_exception_with_id((WASMModuleInstance *)exec_env->module_inst, EXCE_OPERAND_STACK_OVERFLOW);
     }
 
     return frame;
@@ -1495,7 +1510,7 @@ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
 }
 
 static void
-wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+wasm_interp_call_func_bytecode_inner(WASMModuleInstance *module,
                                WASMExecEnv *exec_env,
                                WASMFunctionInstance *cur_func,
                                WASMInterpFrame *prev_frame)
@@ -1609,7 +1624,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* control instructions */
             HANDLE_OP(WASM_OP_UNREACHABLE)
             {
-                wasm_set_exception(module, "unreachable");
+                wasm_set_exception_with_id(module, EXCE_UNREACHABLE);
                 goto got_exception;
             }
 
@@ -1777,7 +1792,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 2;
 
                 if ((uint32)val >= tbl_inst->cur_size) {
-                    wasm_set_exception(module, "undefined element");
+                    wasm_set_exception_with_id(module, EXCE_UNDEFINED_ELEMENT);
                     goto got_exception;
                 }
 
@@ -1785,13 +1800,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_GC == 0
                 fidx = (uint32)tbl_inst->elems[val];
                 if (fidx == (uint32)-1) {
-                    wasm_set_exception(module, "uninitialized element");
+                    wasm_set_exception_with_id(module, EXCE_UNINITIALIZED_ELEMENT);
                     goto got_exception;
                 }
 #else
                 func_obj = (WASMFuncObjectRef)tbl_inst->elems[val];
                 if (!func_obj) {
-                    wasm_set_exception(module, "uninitialized element");
+                    wasm_set_exception_with_id(module, EXCE_UNINITIALIZED_ELEMENT);
                     goto got_exception;
                 }
                 fidx = wasm_func_obj_get_func_idx_bound(func_obj);
@@ -1804,7 +1819,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                  * the elem value while loading
                  */
                 if (fidx >= module->e->function_count) {
-                    wasm_set_exception(module, "unknown function");
+                    wasm_set_exception_with_id_and_message(module, EXCE_INVALID_FUNCTION_INDEX, "unknown function");
                     goto got_exception;
                 }
 
@@ -1819,12 +1834,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 /* clang-format off */
 #if WASM_ENABLE_GC == 0
                 if (cur_type != cur_func_type) {
-                    wasm_set_exception(module, "indirect call type mismatch");
+                    wasm_set_exception_with_id(module, EXCE_INVALID_FUNCTION_TYPE_INDEX);
                     goto got_exception;
                 }
 #else
                 if (!wasm_func_type_is_super_of(cur_type, cur_func_type)) {
-                    wasm_set_exception(module, "indirect call type mismatch");
+                    wasm_set_exception_with_id(module, EXCE_INVALID_FUNCTION_TYPE_INDEX);
                     goto got_exception;
                 }
 #endif
@@ -1961,7 +1976,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                 elem_idx = POP_I32();
                 if (elem_idx >= tbl_inst->cur_size) {
-                    wasm_set_exception(module, "out of bounds table access");
+                    wasm_set_exception_with_id(module, EXCE_OUT_OF_BOUNDS_TABLE_ACCESS);
                     goto got_exception;
                 }
 
@@ -1991,7 +2006,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif
                 elem_idx = POP_I32();
                 if (elem_idx >= tbl_inst->cur_size) {
-                    wasm_set_exception(module, "out of bounds table access");
+                    wasm_set_exception_with_id(module, EXCE_OUT_OF_BOUNDS_TABLE_ACCESS);
                     goto got_exception;
                 }
 
@@ -3688,12 +3703,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 /* TODO: Memory64 the data type depends on mem idx type */
                 aux_stack_top = (uint64)frame_lp[GET_OFFSET()];
                 if (aux_stack_top <= (uint64)exec_env->aux_stack_boundary) {
-                    wasm_set_exception(module, "wasm auxiliary stack overflow");
+                    wasm_set_exception_with_id(module, EXCE_AUX_STACK_OVERFLOW);
                     goto got_exception;
                 }
                 if (aux_stack_top > (uint64)exec_env->aux_stack_bottom) {
-                    wasm_set_exception(module,
-                                       "wasm auxiliary stack underflow");
+                    wasm_set_exception_with_id(module, EXCE_AUX_STACK_UNDERFLOW);
                     goto got_exception;
                 }
                 *(int32 *)global_addr = (uint32)aux_stack_top;
@@ -4293,11 +4307,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 a = frame_lp[GET_OFFSET()];
                 addr_ret = GET_OFFSET();
                 if (a == (int32)0x80000000 && b == -1) {
-                    wasm_set_exception(module, "integer overflow");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_OVERFLOW);
                     goto got_exception;
                 }
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 frame_lp[addr_ret] = (a / b);
@@ -4315,7 +4329,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 b = (uint32)frame_lp[addr1];
                 a = (uint32)frame_lp[addr2];
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 frame_lp[addr_ret] = (a / b);
@@ -4337,7 +4351,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     HANDLE_OP_END();
                 }
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 frame_lp[addr_ret] = (a % b);
@@ -4355,7 +4369,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 b = (uint32)frame_lp[addr1];
                 a = (uint32)frame_lp[addr2];
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 frame_lp[addr_ret] = (a % b);
@@ -4462,11 +4476,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 b = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 a = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 if (a == (int64)0x8000000000000000LL && b == -1) {
-                    wasm_set_exception(module, "integer overflow");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_OVERFLOW);
                     goto got_exception;
                 }
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 PUT_I64_TO_ADDR(frame_lp + GET_OFFSET(), a / b);
@@ -4480,7 +4494,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 b = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 a = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 PUT_I64_TO_ADDR(frame_lp + GET_OFFSET(), a / b);
@@ -4498,7 +4512,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     HANDLE_OP_END();
                 }
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 PUT_I64_TO_ADDR(frame_lp + GET_OFFSET(), a % b);
@@ -4512,7 +4526,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 b = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 a = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 if (b == 0) {
-                    wasm_set_exception(module, "integer divide by zero");
+                    wasm_set_exception_with_id(module, EXCE_INTEGER_DIVIDE_BY_ZERO);
                     goto got_exception;
                 }
                 PUT_I64_TO_ADDR(frame_lp + GET_OFFSET(), a % b);
@@ -4596,55 +4610,55 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_CEIL)
             {
-                DEF_OP_MATH(float32, F32, ceilf);
+                DEF_OP_FP_MATH(float32, F32, ceilf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_FLOOR)
             {
-                DEF_OP_MATH(float32, F32, floorf);
+                DEF_OP_FP_MATH(float32, F32, floorf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_TRUNC)
             {
-                DEF_OP_MATH(float32, F32, truncf);
+                DEF_OP_FP_MATH(float32, F32, truncf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_NEAREST)
             {
-                DEF_OP_MATH(float32, F32, rintf);
+                DEF_OP_FP_MATH(float32, F32, rintf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SQRT)
             {
-                DEF_OP_MATH(float32, F32, sqrtf);
+                DEF_OP_FP_MATH(float32, F32, sqrtf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_ADD)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, +);
+                DEF_OP_FP_NUMERIC(float32, F32, +);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SUB)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, -);
+                DEF_OP_FP_NUMERIC(float32, F32, -);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_MUL)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, *);
+                DEF_OP_FP_NUMERIC(float32, F32, *);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_DIV)
             {
-                DEF_OP_NUMERIC(float32, float32, F32, /);
+                DEF_OP_FP_NUMERIC(float32, F32, /);
                 HANDLE_OP_END();
             }
 
@@ -4702,55 +4716,55 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_CEIL)
             {
-                DEF_OP_MATH(float64, F64, ceil);
+                DEF_OP_FP_MATH(float64, F64, ceil);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_FLOOR)
             {
-                DEF_OP_MATH(float64, F64, floor);
+                DEF_OP_FP_MATH(float64, F64, floor);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_TRUNC)
             {
-                DEF_OP_MATH(float64, F64, trunc);
+                DEF_OP_FP_MATH(float64, F64, trunc);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_NEAREST)
             {
-                DEF_OP_MATH(float64, F64, rint);
+                DEF_OP_FP_MATH(float64, F64, rint);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SQRT)
             {
-                DEF_OP_MATH(float64, F64, sqrt);
+                DEF_OP_FP_MATH(float64, F64, sqrt);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_ADD)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, +);
+                DEF_OP_FP_NUMERIC(float64, F64, +);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SUB)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, -);
+                DEF_OP_FP_NUMERIC(float64, F64, -);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_MUL)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, *);
+                DEF_OP_FP_NUMERIC(float64, F64, *);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_DIV)
             {
-                DEF_OP_NUMERIC_64(float64, float64, F64, /);
+                DEF_OP_FP_NUMERIC(float64, F64, /);
                 HANDLE_OP_END();
             }
 
@@ -4889,7 +4903,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_DEMOTE_F64)
             {
-                DEF_OP_CONVERT(float32, F32, float64, F64);
+                float64 value = GET_OPERAND(float64, F64, 0);
+                SET_OPERAND(F32, 2, wasm_canonical_F32((float32)value));
+                frame_ip += 4;
                 HANDLE_OP_END();
             }
 
@@ -4920,7 +4936,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_PROMOTE_F32)
             {
-                DEF_OP_CONVERT(float64, F64, float32, F32);
+                float32 value = GET_OPERAND(float32, F32, 0);
+                SET_OPERAND(F64, 2, wasm_canonical_F64((float64)value));
+                frame_ip += 4;
                 HANDLE_OP_END();
             }
 
@@ -5337,8 +5355,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         if (offset_len_out_of_bounds(s, n, tbl_seg_len)
                             || offset_len_out_of_bounds(d, n,
                                                         tbl_inst->cur_size)) {
-                            wasm_set_exception(module,
-                                               "out of bounds table access");
+                            wasm_set_exception_with_id(module, EXCE_OUT_OF_BOUNDS_TABLE_ACCESS);
                             goto got_exception;
                         }
 
@@ -5411,8 +5428,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                                      dst_tbl_inst->cur_size)
                             || offset_len_out_of_bounds(
                                 s, n, src_tbl_inst->cur_size)) {
-                            wasm_set_exception(module,
-                                               "out of bounds table access");
+                            wasm_set_exception_with_id(module, EXCE_OUT_OF_BOUNDS_TABLE_ACCESS);
                             goto got_exception;
                         }
 
@@ -5493,8 +5509,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                         if (offset_len_out_of_bounds(i, n,
                                                      tbl_inst->cur_size)) {
-                            wasm_set_exception(module,
-                                               "out of bounds table access");
+                            wasm_set_exception_with_id(module, EXCE_OUT_OF_BOUNDS_TABLE_ACCESS);
                             goto got_exception;
                         }
 
@@ -7446,7 +7461,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 fidx = read_uint32(frame_ip);
 #if WASM_ENABLE_MULTI_MODULE != 0
                 if (fidx >= module->e->function_count) {
-                    wasm_set_exception(module, "unknown function");
+                    wasm_set_exception_with_id_and_message(module, EXCE_INVALID_FUNCTION_INDEX, "unknown function");
                     goto got_exception;
                 }
 #endif
@@ -7463,7 +7478,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 fidx = read_uint32(frame_ip);
 #if WASM_ENABLE_MULTI_MODULE != 0
                 if (fidx >= module->e->function_count) {
-                    wasm_set_exception(module, "unknown function");
+                    wasm_set_exception_with_id_and_message(module, EXCE_INVALID_FUNCTION_INDEX, "unknown function");
                     goto got_exception;
                 }
 #endif
@@ -7560,7 +7575,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         if (cur_func->param_cell_num > 0
             && !(lp_base = lp = wasm_runtime_malloc(cur_func->param_cell_num
                                                     * sizeof(uint32)))) {
-            wasm_set_exception(module, "allocate memory failed");
+            wasm_set_exception_with_id(module, EXCE_OUT_OF_MEMORY);
             goto got_exception;
         }
         for (i = 0; i < cur_func->param_count; i++) {
@@ -7582,7 +7597,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             > exec_env->wasm_stack.top_boundary) {
             if (lp_base)
                 wasm_runtime_free(lp_base);
-            wasm_set_exception(module, "wasm operand stack overflow");
+            wasm_set_exception_with_id(module, EXCE_OPERAND_STACK_OVERFLOW);
             goto got_exception;
         }
         if (lp - lp_base > 0) {
@@ -7619,7 +7634,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
         if ((uint8 *)(outs_area->lp + cur_func->param_cell_num)
             > exec_env->wasm_stack.top_boundary) {
-            wasm_set_exception(module, "wasm operand stack overflow");
+            wasm_set_exception_with_id(module, EXCE_OPERAND_STACK_OVERFLOW);
             goto got_exception;
         }
 
@@ -7679,6 +7694,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
     call_func_from_entry:
     {
+        if (!cur_func->is_import_func) {
+            if (exec_env->forge_call_depth >= exec_env->forge_max_call_depth) {
+                exec_env->forge_depth_exceeded = 1;
+                wasm_set_exception(module, "Forge logical call depth exceeded");
+                return;
+            }
+            exec_env->forge_call_depth++;
+        }
         if (cur_func->is_import_func) {
 #if WASM_ENABLE_MULTI_MODULE != 0
             if (cur_func->import_func_inst) {
@@ -7799,6 +7822,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
     return_func:
     {
+        exec_env->forge_call_depth--;
         FREE_FRAME(exec_env, frame);
         wasm_exec_env_set_cur_frame(exec_env, (WASMRuntimeFrame *)prev_frame);
 
@@ -7817,7 +7841,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
 #if WASM_ENABLE_SHARED_MEMORY != 0
     unaligned_atomic:
-        wasm_set_exception(module, "unaligned atomic");
+        wasm_set_exception_with_id(module, EXCE_UNALIGNED_ATOMIC);
         goto got_exception;
 #endif
 
@@ -7825,7 +7849,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
     || WASM_ENABLE_BULK_MEMORY_OPT != 0
     out_of_bounds:
-        wasm_set_exception(module, "out of bounds memory access");
+        wasm_set_exception_with_id(module, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
 #endif
 
     got_exception:
@@ -7837,6 +7861,16 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #else
     FETCH_OPCODE_AND_DISPATCH();
 #endif
+}
+
+static void
+wasm_interp_call_func_bytecode(WASMModuleInstance *module, WASMExecEnv *exec_env,
+                               WASMFunctionInstance *function, WASMInterpFrame *frame)
+{
+    uint32 depth = exec_env ? exec_env->forge_call_depth : 0;
+    wasm_interp_call_func_bytecode_inner(module, exec_env, function, frame);
+    if (exec_env)
+        exec_env->forge_call_depth = depth;
 }
 
 #if WASM_ENABLE_LABELS_AS_VALUES != 0
@@ -7954,8 +7988,7 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
 
     if ((uint8 *)(outs_area->operand + function->const_cell_num + argc)
         > exec_env->wasm_stack.top_boundary) {
-        wasm_set_exception((WASMModuleInstance *)exec_env->module_inst,
-                           "wasm operand stack overflow");
+        wasm_set_exception_with_id((WASMModuleInstance *)exec_env->module_inst, EXCE_OPERAND_STACK_OVERFLOW);
         return;
     }
 

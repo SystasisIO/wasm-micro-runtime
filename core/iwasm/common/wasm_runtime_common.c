@@ -10,6 +10,7 @@
 #include "wasm_native.h"
 #include "wasm_runtime_common.h"
 #include "wasm_memory.h"
+#include "wasm_fp_environment.h"
 #if WASM_ENABLE_INTERP != 0
 #include "../interpreter/wasm_runtime.h"
 #endif
@@ -61,6 +62,71 @@
 
 #undef CHECK
 #undef CHECK1
+
+static bool
+check_utf8_str(const uint8 *str, uint32 len, bool allow_null)
+{
+    /* Unicode 9.0, section 3.9: reuse the existing runtime name validator. */
+    const uint8 *p = str, *p_end = str + len;
+    uint8 chr;
+
+    while (p < p_end) {
+        chr = *p;
+        if (chr == 0 && !allow_null)
+            return false;
+        else if (chr < 0x80)
+            p++;
+        else if (chr >= 0xC2 && chr <= 0xDF && p + 1 < p_end) {
+            if (p[1] < 0x80 || p[1] > 0xBF)
+                return false;
+            p += 2;
+        }
+        else if (chr >= 0xE0 && chr <= 0xEF && p + 2 < p_end) {
+            if (chr == 0xE0) {
+                if (p[1] < 0xA0 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF)
+                    return false;
+            }
+            else if (chr == 0xED) {
+                if (p[1] < 0x80 || p[1] > 0x9F || p[2] < 0x80 || p[2] > 0xBF)
+                    return false;
+            }
+            else if (p[1] < 0x80 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF)
+                return false;
+            p += 3;
+        }
+        else if (chr >= 0xF0 && chr <= 0xF4 && p + 3 < p_end) {
+            if (chr == 0xF0) {
+                if (p[1] < 0x90 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF
+                    || p[3] < 0x80 || p[3] > 0xBF)
+                    return false;
+            }
+            else if (chr <= 0xF3) {
+                if (p[1] < 0x80 || p[1] > 0xBF || p[2] < 0x80 || p[2] > 0xBF
+                    || p[3] < 0x80 || p[3] > 0xBF)
+                    return false;
+            }
+            else if (p[1] < 0x80 || p[1] > 0x8F || p[2] < 0x80 || p[2] > 0xBF
+                     || p[3] < 0x80 || p[3] > 0xBF)
+                return false;
+            p += 4;
+        }
+        else
+            return false;
+    }
+    return p == p_end;
+}
+
+bool
+wasm_check_utf8_str(const uint8 *str, uint32 len)
+{
+    return check_utf8_str(str, len, false);
+}
+
+bool
+wasm_check_export_name(const uint8 *str, uint32 len)
+{
+    return check_utf8_str(str, len, true);
+}
 
 #if WASM_ENABLE_MULTI_MODULE != 0
 /**
@@ -119,7 +185,8 @@ runtime_malloc(uint64 size, WASMModuleInstanceCommon *module_inst,
 
     if (size >= UINT32_MAX || !(mem = wasm_runtime_malloc((uint32)size))) {
         if (module_inst != NULL) {
-            wasm_runtime_set_exception(module_inst, "allocate memory failed");
+            wasm_set_exception_with_id((WASMModuleInstance *)module_inst,
+                                       EXCE_OUT_OF_MEMORY);
         }
         else if (error_buf != NULL) {
             set_error_buf(error_buf, error_buf_size, "allocate memory failed");
@@ -247,7 +314,7 @@ runtime_signal_handler(void *sig_addr)
 #endif
 
         if (is_sig_addr_in_guard_pages(sig_addr, module_inst)) {
-            wasm_set_exception(module_inst, "out of bounds memory access");
+            wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
             os_longjmp(jmpbuf_node->jmpbuf, 1);
         }
 #if WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
@@ -256,7 +323,7 @@ runtime_signal_handler(void *sig_addr)
                         < stack_min_addr + page_size * guard_page_count) {
             /* The address which causes segmentation fault is inside
                native thread's guard page */
-            wasm_set_exception(module_inst, "native stack overflow");
+            wasm_set_exception_with_id(module_inst, EXCE_NATIVE_STACK_OVERFLOW);
             os_longjmp(jmpbuf_node->jmpbuf, 1);
         }
 #endif
@@ -374,7 +441,7 @@ runtime_exception_handler(EXCEPTION_POINTERS *exce_info)
                    Set exception and let the wasm func continue to run, when
                    the wasm func returns, the caller will check whether the
                    exception is thrown and return to runtime. */
-                wasm_set_exception(module_inst, "out of bounds memory access");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS);
                 ret = next_action(module_inst, exce_info);
                 if (ret == EXCEPTION_CONTINUE_SEARCH
                     || ret == EXCEPTION_CONTINUE_EXECUTION)
@@ -396,7 +463,7 @@ runtime_exception_handler(EXCEPTION_POINTERS *exce_info)
                to run, when the wasm func returns, the caller will check
                whether the exception is thrown and return to runtime, and
                the damaged stack will be recovered by _resetstkoflw(). */
-            wasm_set_exception(module_inst, "native stack overflow");
+            wasm_set_exception_with_id(module_inst, EXCE_NATIVE_STACK_OVERFLOW);
             ret = next_action(module_inst, exce_info);
             if (ret == EXCEPTION_CONTINUE_SEARCH
                 || ret == EXCEPTION_CONTINUE_EXECUTION)
@@ -1658,8 +1725,8 @@ wasm_runtime_get_max_mem(uint32 max_memory_pages, uint32 module_init_page_count,
     return max_memory_pages;
 }
 
-WASMModuleInstanceCommon *
-wasm_runtime_instantiate_internal(WASMModuleCommon *module,
+static WASMModuleInstanceCommon *
+instantiate_unguarded(WASMModuleCommon *module,
                                   WASMModuleInstanceCommon *parent,
                                   WASMExecEnv *exec_env_main,
                                   const struct InstantiationArgs2 *args,
@@ -1680,6 +1747,30 @@ wasm_runtime_instantiate_internal(WASMModuleCommon *module,
     set_error_buf(error_buf, error_buf_size,
                   "Instantiate module failed, invalid module type");
     return NULL;
+}
+
+WASMModuleInstanceCommon *
+wasm_runtime_instantiate_internal(WASMModuleCommon *module,
+                                  WASMModuleInstanceCommon *parent,
+                                  WASMExecEnv *exec_env_main,
+                                  const struct InstantiationArgs2 *args,
+                                  char *error_buf, uint32 error_buf_size)
+{
+    WASMFPEnvironment env;
+    WASMModuleInstanceCommon *result;
+    if (!wasm_fp_enter(&env, exec_env_main)) {
+        set_error_buf(error_buf, error_buf_size, "FP environment setup failed");
+        return NULL;
+    }
+    result = instantiate_unguarded(module, parent, exec_env_main, args,
+                                   error_buf, error_buf_size);
+    if (!wasm_fp_leave(&env, exec_env_main)) {
+        if (result)
+            wasm_runtime_deinstantiate(result);
+        set_error_buf(error_buf, error_buf_size, "FP environment restore failed");
+        return NULL;
+    }
+    return result;
 }
 
 void
@@ -1760,6 +1851,39 @@ wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
                                                 void *custom_data)
 {
     p->custom_data = custom_data;
+}
+
+void
+wasm_runtime_instantiation_args_set_defer_start(struct InstantiationArgs2 *p,
+                                               bool defer_start)
+{
+    p->defer_start = defer_start;
+}
+
+bool
+wasm_runtime_initialize(WASMModuleInstanceCommon *module_inst)
+{
+    return wasm_runtime_initialize_with_exec_env(module_inst, NULL);
+}
+
+bool
+wasm_runtime_initialize_with_exec_env(WASMModuleInstanceCommon *module_inst,
+                                      WASMExecEnv *exec_env)
+{
+    WASMFPEnvironment env;
+    bool result = false;
+    if (!module_inst || (exec_env && exec_env->module_inst != module_inst)
+        || !wasm_fp_enter(&env, exec_env))
+        return false;
+#if WASM_ENABLE_INTERP != 0
+    if (module_inst->module_type == Wasm_Module_Bytecode)
+        result = wasm_initialize((WASMModuleInstance *)module_inst, exec_env);
+#endif
+#if WASM_ENABLE_AOT != 0
+    if (module_inst->module_type == Wasm_Module_AoT)
+        result = aot_initialize((AOTModuleInstance *)module_inst, exec_env);
+#endif
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 #if WASM_ENABLE_LIBC_WASI != 0
@@ -1912,6 +2036,39 @@ WASMModuleCommon *
 wasm_runtime_get_module(WASMModuleInstanceCommon *module_inst)
 {
     return (WASMModuleCommon *)((WASMModuleInstance *)module_inst)->module;
+}
+
+WASMNativeCodePolicy
+wasm_runtime_get_native_code_policy(const WASMModuleCommon *module)
+{
+    WASMNativeCodePolicy policy;
+    uint32 defined_functions;
+    if (!module)
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+    if (module->module_type == Wasm_Module_Bytecode) {
+        const WASMModule *bytecode = (const WASMModule *)module;
+        policy = bytecode->native_code_policy;
+        defined_functions = bytecode->function_count;
+    }
+#if WASM_ENABLE_AOT != 0
+    else if (module->module_type == Wasm_Module_AoT) {
+        const AOTModule *aot = (const AOTModule *)module;
+        policy = aot->native_code_policy;
+        defined_functions = aot->func_count;
+    }
+#endif
+    else
+        return WASM_NATIVE_CODE_UNCOMMITTED;
+
+    if (policy == WASM_NATIVE_CODE_NONE)
+        return defined_functions ? WASM_NATIVE_CODE_UNCOMMITTED : policy;
+    if (policy == WASM_NATIVE_CODE_RX)
+        return policy;
+#if defined(BH_PLATFORM_DARWIN) && defined(BUILD_TARGET_AARCH64)
+    if (policy == WASM_NATIVE_CODE_MAP_JIT)
+        return policy;
+#endif
+    return WASM_NATIVE_CODE_UNCOMMITTED;
 }
 
 WASMExecEnv *
@@ -2278,7 +2435,7 @@ wasm_runtime_get_export_global_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < wasm_module->export_count; i++) {
             const WASMExport *wasm_export = &wasm_module->exports[i];
             if ((wasm_export->kind == WASM_IMPORT_EXPORT_KIND_GLOBAL)
-                && !strcmp(wasm_export->name, name)) {
+                && wasm_name_equals(wasm_export->name, wasm_export->name_len, name)) {
                 const WASMModuleInstanceExtra *e =
                     (WASMModuleInstanceExtra *)wasm_module_inst->e;
                 const WASMGlobalInstance *global =
@@ -2309,7 +2466,7 @@ wasm_runtime_get_export_global_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < aot_module->export_count; i++) {
             const AOTExport *aot_export = &aot_module->exports[i];
             if ((aot_export->kind == WASM_IMPORT_EXPORT_KIND_GLOBAL)
-                && !strcmp(aot_export->name, name)) {
+                && wasm_name_equals(aot_export->name, aot_export->name_len, name)) {
                 const AOTGlobal *global =
                     &aot_module->globals[aot_export->index];
                 global_inst->kind = val_type_to_val_kind(global->type.val_type);
@@ -2339,7 +2496,7 @@ wasm_runtime_get_export_table_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < wasm_module->export_count; i++) {
             const WASMExport *wasm_export = &wasm_module->exports[i];
             if ((wasm_export->kind == WASM_IMPORT_EXPORT_KIND_TABLE)
-                && !strcmp(wasm_export->name, name)) {
+                && wasm_name_equals(wasm_export->name, wasm_export->name_len, name)) {
                 const WASMTableInstance *wasm_table_inst =
                     wasm_module_inst->tables[wasm_export->index];
                 table_inst->elem_kind =
@@ -2361,7 +2518,7 @@ wasm_runtime_get_export_table_inst(WASMModuleInstanceCommon *const module_inst,
         for (i = 0; i < aot_module->export_count; i++) {
             const AOTExport *aot_export = &aot_module->exports[i];
             if ((aot_export->kind == WASM_IMPORT_EXPORT_KIND_TABLE)
-                && !strcmp(aot_export->name, name)) {
+                && wasm_name_equals(aot_export->name, aot_export->name_len, name)) {
                 const AOTTableInstance *aot_table_inst =
                     aot_module_inst->tables[aot_export->index];
                 table_inst->elem_kind =
@@ -2764,8 +2921,8 @@ wasm_runtime_finalize_call_function(WASMExecEnv *exec_env,
 }
 #endif
 
-bool
-wasm_runtime_call_wasm(WASMExecEnv *exec_env,
+static bool
+call_wasm_unguarded(WASMExecEnv *exec_env,
                        WASMFunctionInstanceCommon *function, uint32 argc,
                        uint32 argv[])
 {
@@ -2820,6 +2977,19 @@ wasm_runtime_call_wasm(WASMExecEnv *exec_env,
 #endif
 
     return ret;
+}
+
+bool
+wasm_runtime_call_wasm(WASMExecEnv *exec_env,
+                       WASMFunctionInstanceCommon *function, uint32 argc,
+                       uint32 argv[])
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env, exec_env))
+        return false;
+    result = call_wasm_unguarded(exec_env, function, argc, argv);
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 static void
@@ -3201,35 +3371,54 @@ wasm_runtime_get_exec_env_singleton(WASMModuleInstanceCommon *module_inst_comm)
     return module_inst->exec_env_singleton;
 }
 
-static void
-wasm_set_exception_local(WASMModuleInstance *module_inst, const char *exception)
+void
+wasm_set_exception_local(WASMModuleInstance *module_inst, const char *exception,
+                         WASMExceptionInfo info)
 {
     exception_lock(module_inst);
     if (exception) {
         snprintf(module_inst->cur_exception, sizeof(module_inst->cur_exception),
-                 "Exception: %s", exception);
+                 "%s", exception);
     }
     else {
         module_inst->cur_exception[0] = '\0';
+        info.status = WASM_EXCEPTION_NONE;
+        info.id = 0;
     }
+    GetModuleInstanceExtraCommon(module_inst)->exception_info = info;
     exception_unlock(module_inst);
+}
+
+static void
+set_exception_with_info(WASMModuleInstance *module_inst, const char *exception,
+                        WASMExceptionInfo info)
+{
+    char formatted[EXCEPTION_BUF_LEN];
+    if (exception) {
+        snprintf(formatted, sizeof(formatted), "Exception: %s", exception);
+        exception = formatted;
+    }
+#if WASM_ENABLE_THREAD_MGR != 0
+    WASMExecEnv *exec_env =
+        wasm_clusters_search_exec_env((WASMModuleInstanceCommon *)module_inst);
+    if (exec_env) {
+        wasm_cluster_set_exception(exec_env, exception, info);
+    }
+    else {
+        wasm_set_exception_local(module_inst, exception, info);
+    }
+#else
+    wasm_set_exception_local(module_inst, exception, info);
+#endif
 }
 
 void
 wasm_set_exception(WASMModuleInstance *module_inst, const char *exception)
 {
-#if WASM_ENABLE_THREAD_MGR != 0
-    WASMExecEnv *exec_env =
-        wasm_clusters_search_exec_env((WASMModuleInstanceCommon *)module_inst);
-    if (exec_env) {
-        wasm_cluster_set_exception(exec_env, exception);
-    }
-    else {
-        wasm_set_exception_local(module_inst, exception);
-    }
-#else
-    wasm_set_exception_local(module_inst, exception);
-#endif
+    WASMExceptionInfo info = {
+        exception ? WASM_EXCEPTION_UNKNOWN : WASM_EXCEPTION_NONE, 0
+    };
+    set_exception_with_info(module_inst, exception, info);
 }
 
 /* clang-format off */
@@ -3276,10 +3465,23 @@ static const char *exception_msgs[] = {
 void
 wasm_set_exception_with_id(WASMModuleInstance *module_inst, uint32 id)
 {
-    if (id < EXCE_NUM)
-        wasm_set_exception(module_inst, exception_msgs[id]);
-    else
-        wasm_set_exception(module_inst, "unknown exception");
+    wasm_set_exception_with_id_and_message(
+        module_inst, id,
+        id < EXCE_NUM ? exception_msgs[id] : "unknown exception");
+}
+
+void
+wasm_set_exception_with_id_and_message(WASMModuleInstance *module_inst,
+                                      uint32 id, const char *exception)
+{
+    WASMExceptionInfo info = { WASM_EXCEPTION_UNKNOWN, 0 };
+    if (id == EXCE_ALREADY_THROWN)
+        return;
+    if (id < EXCE_NUM) {
+        info.status = WASM_EXCEPTION_KNOWN;
+        info.id = id;
+    }
+    set_exception_with_info(module_inst, exception, info);
 }
 
 const char *
@@ -3332,6 +3534,20 @@ wasm_runtime_get_exception(WASMModuleInstanceCommon *module_inst_comm)
     bh_assert(module_inst_comm->module_type == Wasm_Module_Bytecode
               || module_inst_comm->module_type == Wasm_Module_AoT);
     return wasm_get_exception(module_inst);
+}
+
+WASMExceptionInfo
+wasm_runtime_get_exception_info(WASMModuleInstanceCommon *module_inst_comm)
+{
+    WASMModuleInstance *module_inst = (WASMModuleInstance *)module_inst_comm;
+    WASMExceptionInfo info;
+
+    bh_assert(module_inst_comm->module_type == Wasm_Module_Bytecode
+              || module_inst_comm->module_type == Wasm_Module_AoT);
+    exception_lock(module_inst);
+    info = GetModuleInstanceExtraCommon(module_inst)->exception_info;
+    exception_unlock(module_inst);
+    return info;
 }
 
 bool
@@ -4899,8 +5115,8 @@ wasm_runtime_unregister_natives(const char *module_name,
     return wasm_native_unregister_natives(module_name, native_symbols);
 }
 
-bool
-wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_raw_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                                const WASMFuncType *func_type,
                                const char *signature, void *attachment,
                                uint32 *argv, uint32 argc, uint32 *argv_ret)
@@ -5187,8 +5403,8 @@ static volatile VoidFuncPtr invokeNative_Void =
 #define MAX_REG_FLOATS 8
 #endif
 
-bool
-wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                            const WASMFuncType *func_type, const char *signature,
                            void *attachment, uint32 *argv, uint32 argc,
                            uint32 *argv_ret)
@@ -5751,8 +5967,8 @@ word_copy(uint32 *dest, uint32 *src, unsigned num)
         *dest++ = *src++;
 }
 
-bool
-wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                            const WASMFuncType *func_type, const char *signature,
                            void *attachment, uint32 *argv, uint32 argc,
                            uint32 *argv_ret)
@@ -6059,8 +6275,8 @@ static V128FuncPtr invokeNative_V128 = (V128FuncPtr)(uintptr_t)invokeNative;
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((no_sanitize_address))
 #endif
-bool
-wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+static bool
+invoke_native_unguarded(WASMExecEnv *exec_env, void *func_ptr,
                            const WASMFuncType *func_type, const char *signature,
                            void *attachment, uint32 *argv, uint32 argc,
                            uint32 *argv_ret)
@@ -6236,25 +6452,25 @@ wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
 #endif
 #endif
                 if (n_ints < MAX_REG_INTS)
-                    ints[n_ints++] = *(uint64 *)argv_src;
+                    ints[n_ints++] = GET_I64_FROM_ADDR(argv_src);
                 else
-                    stacks[n_stacks++] = *(uint64 *)argv_src;
+                    stacks[n_stacks++] = GET_I64_FROM_ADDR(argv_src);
                 argv_src += 2;
                 break;
             case VALUE_TYPE_F32:
                 if (n_fps < MAX_REG_FLOATS) {
-                    *(float32 *)&fps[n_fps++] = *(float32 *)argv_src++;
+                    memcpy(&fps[n_fps++], argv_src++, sizeof(float32));
                 }
                 else {
-                    *(float32 *)&stacks[n_stacks++] = *(float32 *)argv_src++;
+                    memcpy(&stacks[n_stacks++], argv_src++, sizeof(float32));
                 }
                 break;
             case VALUE_TYPE_F64:
                 if (n_fps < MAX_REG_FLOATS) {
-                    *(float64 *)&fps[n_fps++] = *(float64 *)argv_src;
+                    memcpy(&fps[n_fps++], argv_src, sizeof(float64));
                 }
                 else {
-                    *(float64 *)&stacks[n_stacks++] = *(float64 *)argv_src;
+                    memcpy(&stacks[n_stacks++], argv_src, sizeof(float64));
                 }
                 argv_src += 2;
                 break;
@@ -6303,9 +6519,9 @@ wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
     /* Save extra result values' address to argv1 */
     for (i = 0; i < ext_ret_count; i++) {
         if (n_ints < MAX_REG_INTS)
-            ints[n_ints++] = *(uint64 *)argv_src;
+            ints[n_ints++] = GET_I64_FROM_ADDR(argv_src);
         else
-            stacks[n_stacks++] = *(uint64 *)argv_src;
+            stacks[n_stacks++] = GET_I64_FROM_ADDR(argv_src);
         argv_src += 2;
     }
 
@@ -6403,7 +6619,37 @@ fail:
                  || defined(BUILD_TARGET_RISCV64_LP64) */
 
 bool
-wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
+wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
+                           const WASMFuncType *func_type, const char *signature,
+                           void *attachment, uint32 *argv, uint32 argc,
+                           uint32 *argv_ret)
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env, exec_env))
+        return false;
+    result = invoke_native_unguarded(exec_env, func_ptr, func_type, signature,
+                                     attachment, argv, argc, argv_ret);
+    return wasm_fp_leave(&env, exec_env) && result;
+}
+
+bool
+wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
+                               const WASMFuncType *func_type, const char *signature,
+                               void *attachment, uint32 *argv, uint32 argc,
+                               uint32 *argv_ret)
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env, exec_env))
+        return false;
+    result = invoke_native_raw_unguarded(exec_env, func_ptr, func_type, signature,
+                                         attachment, argv, argc, argv_ret);
+    return wasm_fp_leave(&env, exec_env) && result;
+}
+
+static bool
+call_indirect_unguarded(WASMExecEnv *exec_env, uint32 element_index,
                            uint32 argc, uint32 argv[])
 {
     bool ret = false;
@@ -6427,6 +6673,18 @@ wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
 #endif
 
     return ret;
+}
+
+bool
+wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
+                           uint32 argc, uint32 argv[])
+{
+    WASMFPEnvironment env;
+    bool result;
+    if (!wasm_fp_enter(&env, exec_env))
+        return false;
+    result = call_indirect_unguarded(exec_env, element_index, argc, argv);
+    return wasm_fp_leave(&env, exec_env) && result;
 }
 
 static void
@@ -7619,7 +7877,8 @@ loader_find_export(const WASMModuleCommon *module, const char *module_name,
     }
 #endif
     for (i = 0, export = exports; i < export_count; ++i, ++export) {
-        if (export->kind == export_kind && !strcmp(field_name, export->name)) {
+        if (export->kind == export_kind
+            && wasm_name_equals(export->name, export->name_len, field_name)) {
             result = export;
             goto exit;
         }

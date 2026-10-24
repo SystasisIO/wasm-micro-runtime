@@ -1293,6 +1293,7 @@ wasm_cluster_resume_all(WASMCluster *cluster)
 struct spread_exception_data {
     WASMExecEnv *skip;
     const char *exception;
+    WASMExceptionInfo info;
 };
 
 static void
@@ -1305,15 +1306,7 @@ set_exception_visitor(void *node, void *user_data)
         WASMModuleInstance *wasm_inst =
             (WASMModuleInstance *)get_module_inst(exec_env);
 
-        exception_lock(wasm_inst);
-        if (data->exception != NULL) {
-            snprintf(wasm_inst->cur_exception, sizeof(wasm_inst->cur_exception),
-                     "Exception: %s", data->exception);
-        }
-        else {
-            wasm_inst->cur_exception[0] = '\0';
-        }
-        exception_unlock(wasm_inst);
+        wasm_set_exception_local(wasm_inst, data->exception, data->info);
 
         /* Terminate the thread so it can exit from dead loops */
         if (data->exception != NULL) {
@@ -1326,7 +1319,8 @@ set_exception_visitor(void *node, void *user_data)
 }
 
 void
-wasm_cluster_set_exception(WASMExecEnv *exec_env, const char *exception)
+wasm_cluster_set_exception(WASMExecEnv *exec_env, const char *exception,
+                           WASMExceptionInfo info)
 {
     const bool has_exception = exception != NULL;
     WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
@@ -1335,6 +1329,7 @@ wasm_cluster_set_exception(WASMExecEnv *exec_env, const char *exception)
     struct spread_exception_data data;
     data.skip = NULL;
     data.exception = exception;
+    data.info = info;
 
     os_mutex_lock(&cluster->lock);
 #if WASM_ENABLE_DUMP_CALL_STACK != 0

@@ -15,6 +15,7 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/TargetPassConfig.h"
 
 #include "aot_orc_extra.h"
 #include "bh_log.h"
@@ -78,12 +79,27 @@ PrintStackSizes::runOnMachineFunction(llvm::MachineFunction &MF)
 class MyPassManager : public llvm::legacy::PassManager
 {
   public:
+    explicit MyPassManager(bool instruction_profile)
+      : instruction_profile(instruction_profile)
+    {}
     void add(llvm::Pass *P) override;
+
+  private:
+    bool instruction_profile;
 };
 
 void
 MyPassManager::add(llvm::Pass *P)
 {
+#if LLVM_VERSION_MAJOR >= 22
+    if (instruction_profile && P->getPassID() == &llvm::TargetPassConfig::ID) {
+        /* MachineSink merges moved instructions with the destination's debug
+           location, losing exact WASM offsets (often to line zero). Disable
+           only that pass on this profiled compilation, never process-wide. */
+        static_cast<llvm::TargetPassConfig *>(P)->disablePass(
+            &llvm::MachineSinkingLegacyID);
+    }
+#endif
     // a hack to avoid having a copy of the whole addPassesToEmitMC.
     // we want to add PrintStackSizes before FreeMachineFunctionPass.
     if (P->getPassName() == "Free MachineFunction") {
@@ -97,13 +113,16 @@ MyPassManager::add(llvm::Pass *P)
 llvm::Expected<llvm::orc::SimpleCompiler::CompileResult>
 MyCompiler::operator()(llvm::Module &M)
 {
-    auto TM = cantFail(JTMB.createTargetMachine());
+    auto Target = JTMB.createTargetMachine();
+    if (!Target)
+        return Target.takeError();
+    auto TM = std::move(*Target);
     llvm::SmallVector<char, 0> ObjBufferSV;
 
     {
         llvm::raw_svector_ostream ObjStream(ObjBufferSV);
 
-        MyPassManager PM;
+        MyPassManager PM(M.getModuleFlag("wamr.jit_instruction_profile") != nullptr);
         llvm::MCContext *Ctx;
         if (TM->addPassesToEmitMC(PM, Ctx, ObjStream))
             return llvm::make_error<llvm::StringError>(

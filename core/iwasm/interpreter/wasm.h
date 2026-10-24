@@ -17,6 +17,14 @@
 extern "C" {
 #endif
 
+/* Internal native-code publication state, not an OS capability estimate. */
+typedef enum WASMNativeCodePolicy {
+    WASM_NATIVE_CODE_UNCOMMITTED = 0,
+    WASM_NATIVE_CODE_NONE,
+    WASM_NATIVE_CODE_RX,
+    WASM_NATIVE_CODE_MAP_JIT
+} WASMNativeCodePolicy;
+
 /* Value Type */
 #define VALUE_TYPE_I32 0x7F
 #define VALUE_TYPE_I64 0X7E
@@ -706,6 +714,12 @@ struct WASMFunction {
 
     uint32 max_stack_cell_num;
     uint32 max_block_num;
+    /* Forge admission observations, before interpreter-specific lowering. */
+    uint32 forge_body_bytes;
+    uint32 forge_local_sets;
+    uint32 forge_operand_cells;
+    uint32 forge_br_table_elements;
+    uint64 forge_memory_offset;
     uint32 code_size;
     uint8 *code;
 #if WASM_ENABLE_FAST_INTERP != 0
@@ -796,9 +810,26 @@ struct WASMGlobal {
 
 typedef struct WASMExport {
     char *name;
+    uint32 name_len;
     uint8 kind;
     uint32 index;
 } WASMExport;
+
+static inline int
+wasm_name_compare(const char *left, uint32 left_len,
+                 const char *right, uint32 right_len)
+{
+    uint32 size = left_len < right_len ? left_len : right_len;
+    int order = size ? memcmp(left, right, size) : 0;
+    return order ? order : (left_len > right_len) - (left_len < right_len);
+}
+
+static inline bool
+wasm_name_equals(const char *name, uint32 name_len, const char *text)
+{
+    size_t text_len = strlen(text);
+    return name_len == text_len && !memcmp(name, text, text_len);
+}
 
 typedef struct WASMTableSeg {
     /* 0 to 7 */
@@ -855,6 +886,7 @@ typedef struct WASIArguments {
 typedef struct StringNode {
     struct StringNode *next;
     char *str;
+    uint32 len;
 } StringNode, *StringList;
 
 typedef struct BrTableCache {
@@ -916,6 +948,9 @@ struct WASMModule {
     uint32 type_count;
     uint32 import_count;
     uint32 function_count;
+    uint64 forge_legacy_depth;
+    uint64 forge_max_legacy_depth;
+    uint8 forge_block_type_mode;
     uint32 table_count;
     uint32 memory_count;
 #if WASM_ENABLE_TAGS != 0
@@ -1161,6 +1196,9 @@ struct WASMModule {
 
     /* Whether the underlying wasm binary buffer can be freed */
     bool is_binary_freeable;
+
+    /* Published only after complete bounded eager-JIT preparation. */
+    WASMNativeCodePolicy native_code_policy;
 };
 
 typedef struct BlockType {

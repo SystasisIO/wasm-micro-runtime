@@ -28,6 +28,12 @@
 extern "C" {
 #endif
 
+bool
+wasm_check_utf8_str(const uint8 *str, uint32 len);
+
+bool
+wasm_check_export_name(const uint8 *str, uint32 len);
+
 /* Internal use for setting default running mode */
 #define Mode_Default 0
 
@@ -500,6 +506,11 @@ typedef struct WASMModuleCommon {
     uint8 module_data[1];
 } WASMModuleCommon;
 
+/* Read an immutable publication snapshot while the module owner is pinned.
+   NONE is valid only for modules without defined native guest bodies. */
+WASMNativeCodePolicy
+wasm_runtime_get_native_code_policy(const WASMModuleCommon *module);
+
 typedef struct WASMModuleInstanceCommon {
     /* Module instance type, for module instance loaded from WASM
        bytecode binary, this field is Wasm_Module_Bytecode, and this
@@ -618,6 +629,7 @@ wasm_runtime_get_exec_env_tls(void);
 struct InstantiationArgs2 {
     InstantiationArgs v1;
     void *custom_data;
+    bool defer_start;
 #if WASM_ENABLE_LIBC_WASI != 0
     WASIArguments wasi;
 #endif
@@ -965,6 +977,10 @@ wasm_runtime_set_exception(WASMModuleInstanceCommon *module,
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN const char *
 wasm_runtime_get_exception(WASMModuleInstanceCommon *module);
+
+/* See wasm_export.h for description */
+WASM_RUNTIME_API_EXTERN WASMExceptionInfo
+wasm_runtime_get_exception_info(WASMModuleInstanceCommon *module_inst);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN void

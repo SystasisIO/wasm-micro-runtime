@@ -24,6 +24,8 @@
 #endif
 #if WASM_ENABLE_JIT != 0
 #include "../compilation/aot_llvm.h"
+#include "../compilation/aot_jit_profile.h"
+#include "../compilation/aot_orc_extra.h"
 #endif
 
 #ifndef TRACE_WASM_LOADER
@@ -3530,7 +3532,10 @@ fail:
 static int
 cmp_export_name(const void *a, const void *b)
 {
-    return strcmp(*(char **)a, *(char **)b);
+    const WASMExport *left = *(const WASMExport *const *)a;
+    const WASMExport *right = *(const WASMExport *const *)b;
+    return wasm_name_compare(left->name, left->name_len,
+                             right->name, right->name_len);
 }
 
 static bool
@@ -3865,6 +3870,7 @@ load_function_section(const uint8 *buf, const uint8 *buf_end,
     uint64 total_size;
     uint32 code_count = 0, code_size, type_index, i, j, k, local_type_index;
     uint32 local_count, local_set_count, sub_local_count, local_cell_num;
+    uint32 forge_body_bytes;
     uint8 type;
     WASMFunction *func;
 #if WASM_ENABLE_GC != 0
@@ -3924,6 +3930,7 @@ load_function_section(const uint8 *buf, const uint8 *buf_end,
             }
 
             /* Resolve local set count */
+            forge_body_bytes = code_size;
             p_code_end = p_code + code_size;
 #if WASM_ENABLE_BRANCH_HINTS != 0
             uint8 *p_body_start = (uint8 *)p_code;
@@ -4005,6 +4012,8 @@ load_function_section(const uint8 *buf, const uint8 *buf_end,
             /* Set function type, local count, code size and code body */
             func->func_type = (WASMFuncType *)module->types[type_index];
             func->local_count = local_count;
+            func->forge_body_bytes = forge_body_bytes;
+            func->forge_local_sets = local_set_count;
             if (local_count > 0)
                 func->local_types = (uint8 *)func + sizeof(WASMFunction);
             func->code_size = code_size;
@@ -4440,10 +4449,10 @@ check_duplicate_exports(WASMModule *module, char *error_buf,
 {
     uint32 i;
     bool result = false;
-    char *names_buf[32], **names = names_buf;
+    const WASMExport *names_buf[32], **names = names_buf;
 
     if (module->export_count > 32) {
-        names = loader_malloc(module->export_count * sizeof(char *), error_buf,
+        names = loader_malloc(module->export_count * sizeof(*names), error_buf,
                               error_buf_size);
         if (!names) {
             return result;
@@ -4451,13 +4460,13 @@ check_duplicate_exports(WASMModule *module, char *error_buf,
     }
 
     for (i = 0; i < module->export_count; i++) {
-        names[i] = module->exports[i].name;
+        names[i] = &module->exports[i];
     }
 
-    qsort(names, module->export_count, sizeof(char *), cmp_export_name);
+    qsort(names, module->export_count, sizeof(*names), cmp_export_name);
 
     for (i = 1; i < module->export_count; i++) {
-        if (!strcmp(names[i], names[i - 1])) {
+        if (cmp_export_name(&names[i], &names[i - 1]) == 0) {
             set_error_buf(error_buf, error_buf_size, "duplicate export name");
             goto cleanup;
         }
@@ -4506,7 +4515,8 @@ load_export_section(const uint8 *buf, const uint8 *buf_end, WASMModule *module,
             read_leb_uint32(p, p_end, str_len);
             CHECK_BUF(p, p_end, str_len);
 
-            if (!(export->name = wasm_const_str_list_insert(
+            export->name_len = str_len;
+            if (!(export->name = wasm_export_name_insert(
                       p, str_len, module, is_load_from_file_buf, error_buf,
                       error_buf_size))) {
                 return false;
@@ -5883,7 +5893,9 @@ init_fast_jit_functions(WASMModule *module, char *error_buf,
 
 #if WASM_ENABLE_JIT != 0
 static bool
-init_llvm_jit_functions_stage1(WASMModule *module, char *error_buf,
+init_llvm_jit_functions_stage1(WASMModule *module,
+                               const WASMLoadBudget *budget,
+                               uint64 native_map_limit, char *error_buf,
                                uint32 error_buf_size)
 {
     LLVMJITOptions *llvm_jit_options = wasm_runtime_get_llvm_jit_options();
@@ -5930,6 +5942,9 @@ init_llvm_jit_functions_stage1(WASMModule *module, char *error_buf,
     }
 
     option.is_jit_mode = true;
+    option.jit_compile_on_caller_thread = budget != NULL;
+    option.jit_load_budget = budget;
+    option.jit_native_map_limit = native_map_limit;
 
     option.opt_level = llvm_jit_options->opt_level;
     option.size_level = llvm_jit_options->size_level;
@@ -6047,6 +6062,21 @@ init_llvm_jit_functions_stage2(WASMModule *module, char *error_buf,
     bh_print_time("End lookup llvm jit functions");
 
     return true;
+}
+
+static void
+destroy_llvm_jit_functions(WASMModule *module)
+{
+    if (module->func_ptrs)
+        wasm_runtime_free(module->func_ptrs);
+    if (module->comp_ctx)
+        aot_destroy_comp_context(module->comp_ctx);
+    if (module->comp_data)
+        aot_destroy_comp_data(module->comp_data);
+    module->func_ptrs = NULL;
+    module->func_ptrs_compiled = NULL;
+    module->comp_ctx = NULL;
+    module->comp_data = NULL;
 }
 #endif /* end of WASM_ENABLE_JIT != 0 */
 
@@ -6306,6 +6336,127 @@ compile_jit_functions(WASMModule *module, char *error_buf,
 }
 #endif /* end of WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0 */
 
+bool
+wasm_loader_compile_llvm_jit(WASMModule *module, char *error_buf,
+                             uint32 error_buf_size)
+{
+    (void)module;
+    set_error_buf(error_buf, error_buf_size,
+                  "explicit LLVM JIT requires a native allocation owner");
+    return false;
+}
+
+static bool
+compile_llvm_jit_impl(
+    WASMModule *module, const WASMLoadBudget *budget, uint64 native_map_limit,
+    bool instruction_profile, char *error_buf,
+    uint32 error_buf_size)
+{
+#if WASM_ENABLE_JIT != 0 && WASM_ENABLE_FAST_JIT == 0 \
+    && WASM_ENABLE_LAZY_JIT == 0
+    uint32 i;
+    WASMNativeCodePolicy policy;
+    if (!module || module->module_type != Wasm_Module_Bytecode || !budget
+        || !budget->begin_mapping || !budget->complete_mapping || !budget->unmap
+        || !budget->check || !budget->before_protect || !budget->allocation_failed
+        || !budget->protection_failed || !native_map_limit
+        || native_map_limit > ((uint64)1 << 30)) {
+        set_error_buf(error_buf, error_buf_size, "invalid bounded LLVM JIT request");
+        return false;
+    }
+    if (module->comp_ctx || module->comp_data || module->func_ptrs) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT module already has compiler state");
+        return false;
+    }
+    module->native_code_policy = WASM_NATIVE_CODE_UNCOMMITTED;
+    if (!budget->check(budget->context)) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
+        return false;
+    }
+    if (!module->function_count) {
+        module->native_code_policy = WASM_NATIVE_CODE_NONE;
+        return true;
+    }
+    if (!init_llvm_jit_functions_stage1(module, budget, native_map_limit,
+                                       error_buf, error_buf_size))
+        goto fail;
+    if (instruction_profile
+        && !aot_jit_profile_enable(module->comp_ctx)) {
+        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
+        goto fail;
+    }
+    if (!init_llvm_jit_functions_stage2(module, error_buf, error_buf_size))
+        goto fail;
+    /* Eager LLJIT lookup has compiled the complete IR module. Unlike the lazy
+       worker path there is no reason to invoke native wrapper functions. */
+    if (!module->comp_ctx->jit_stack_sizes) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT stack metadata is absent");
+        goto fail;
+    }
+    for (i = 0; i < module->function_count; ++i) {
+        if (!module->func_ptrs[i]
+            || module->comp_ctx->jit_stack_sizes[i] == UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "LLVM JIT materialization is incomplete");
+            goto fail;
+        }
+        module->func_ptrs_compiled[i] = true;
+    }
+    if (!budget->check(budget->context)) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
+        goto fail;
+    }
+    if (!aot_jit_profile_publish(module->comp_ctx)) {
+        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
+        goto fail;
+    }
+    if (!budget->check(budget->context)) {
+        set_error_buf(error_buf, error_buf_size, "LLVM JIT owner is unavailable");
+        goto fail;
+    }
+    policy = LLVMOrcLLLazyJITGetNativeCodePolicy(module->comp_ctx->orc_jit);
+    if (policy != WASM_NATIVE_CODE_RX && policy != WASM_NATIVE_CODE_MAP_JIT) {
+        budget->protection_failed(budget->context);
+        set_error_buf(error_buf, error_buf_size,
+                      "LLVM JIT native protection is uncommitted");
+        goto fail;
+    }
+    module->native_code_policy = policy;
+    return true;
+fail:
+    module->native_code_policy = WASM_NATIVE_CODE_UNCOMMITTED;
+    destroy_llvm_jit_functions(module);
+    return false;
+#else
+    (void)module;
+    (void)budget;
+    (void)native_map_limit;
+    (void)instruction_profile;
+    set_error_buf(error_buf, error_buf_size,
+                  "bounded LLVM JIT requires an LLVM-only eager profile");
+    return false;
+#endif
+}
+
+bool
+wasm_loader_compile_llvm_jit_ex(WASMModule *module,
+                                const WASMLoadBudget *budget,
+                                uint64 native_map_limit, char *error_buf,
+                                uint32 error_buf_size)
+{
+    return compile_llvm_jit_impl(module, budget, native_map_limit, false,
+                                 error_buf, error_buf_size);
+}
+
+bool
+wasm_loader_compile_llvm_jit_profile_ex(WASMModule *module,
+                                        const WASMLoadBudget *budget,
+                                        uint64 max_native_bytes,
+                                        char *error_buf, uint32 error_buf_size)
+{
+    return compile_llvm_jit_impl(module, budget, max_native_bytes, true,
+                                 error_buf, error_buf_size);
+}
+
 static bool
 wasm_loader_prepare_bytecode(WASMModule *module, WASMFunction *func,
                              uint32 cur_func_idx, char *error_buf,
@@ -6321,7 +6472,8 @@ static void **handle_table;
 static bool
 load_from_sections(WASMModule *module, WASMSection *sections,
                    bool is_load_from_file_buf, bool wasm_binary_freeable,
-                   bool no_resolve, char *error_buf, uint32 error_buf_size)
+                   bool no_resolve, bool defer_jit, char *error_buf,
+                   uint32 error_buf_size)
 {
     WASMExport *export;
     WASMSection *section = sections;
@@ -6480,7 +6632,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
     export = module->exports;
     for (i = 0; i < module->export_count; i++, export ++) {
         if (export->kind == EXPORT_KIND_GLOBAL) {
-            if (!strcmp(export->name, "__heap_base")) {
+            if (wasm_name_equals(export->name, export->name_len, "__heap_base")) {
                 if (export->index < module->import_global_count) {
                     LOG_DEBUG("Skip the process if __heap_base is imported "
                               "instead of being a local global");
@@ -6502,7 +6654,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                                 aux_heap_base);
                 }
             }
-            else if (!strcmp(export->name, "__data_end")) {
+            else if (wasm_name_equals(export->name, export->name_len, "__data_end")) {
                 if (export->index < module->import_global_count) {
                     LOG_DEBUG("Skip the process if __data_end is imported "
                               "instead of being a local global");
@@ -6608,7 +6760,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
     export = module->exports;
     for (i = 0; i < module->export_count; i++, export ++) {
         if (export->kind == EXPORT_KIND_FUNC) {
-            if (!strcmp(export->name, "malloc")
+            if (wasm_name_equals(export->name, export->name_len, "malloc")
                 && export->index >= module->import_function_count) {
                 func_index = export->index - module->import_function_count;
                 func_type = module->functions[func_index]->func_type;
@@ -6621,7 +6773,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                                 export->name, export->index);
                 }
             }
-            else if (!strcmp(export->name, "__new")
+            else if (wasm_name_equals(export->name, export->name_len, "__new")
                      && export->index >= module->import_function_count) {
                 /* __new && __pin for AssemblyScript */
                 func_index = export->index - module->import_function_count;
@@ -6643,8 +6795,8 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                     export_tmp = module->exports;
                     for (j = 0; j < module->export_count; j++, export_tmp++) {
                         if ((export_tmp->kind == EXPORT_KIND_FUNC)
-                            && (!strcmp(export_tmp->name, "__retain")
-                                || (!strcmp(export_tmp->name, "__pin")))
+                            && (wasm_name_equals(export_tmp->name, export_tmp->name_len, "__retain")
+                                || wasm_name_equals(export_tmp->name, export_tmp->name_len, "__pin"))
                             && (export_tmp->index
                                 >= module->import_function_count)) {
                             func_index = export_tmp->index
@@ -6673,9 +6825,9 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                     }
                 }
             }
-            else if (((!strcmp(export->name, "free"))
-                      || (!strcmp(export->name, "__release"))
-                      || (!strcmp(export->name, "__unpin")))
+            else if ((wasm_name_equals(export->name, export->name_len, "free")
+                      || wasm_name_equals(export->name, export->name_len, "__release")
+                      || wasm_name_equals(export->name, export->name_len, "__unpin"))
                      && export->index >= module->import_function_count) {
                 func_index = export->index - module->import_function_count;
                 func_type = module->functions[func_index]->func_type;
@@ -6792,46 +6944,58 @@ load_from_sections(WASMModule *module, WASMSection *sections,
 
     calculate_global_data_offset(module);
 
+#if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0
+    /* Admission-only loads must not create compiler state, executable mappings
+       or compiler workers. The zero-default load option keeps upstream JIT
+       initialization unchanged for other callers. */
+    if (!defer_jit) {
+#endif
 #if WASM_ENABLE_FAST_JIT != 0
-    if (!init_fast_jit_functions(module, error_buf, error_buf_size)) {
-        return false;
-    }
+        if (!init_fast_jit_functions(module, error_buf, error_buf_size)) {
+            return false;
+        }
 #endif
 
 #if WASM_ENABLE_JIT != 0
-    if (!init_llvm_jit_functions_stage1(module, error_buf, error_buf_size)) {
-        return false;
-    }
+        if (!init_llvm_jit_functions_stage1(module, NULL, 0, error_buf,
+                                           error_buf_size)) {
+            return false;
+        }
 #if !(WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_LAZY_JIT != 0)
-    if (!init_llvm_jit_functions_stage2(module, error_buf, error_buf_size)) {
-        return false;
-    }
+        if (!init_llvm_jit_functions_stage2(module, error_buf, error_buf_size)) {
+            return false;
+        }
 #else
-    /* Run aot_compile_wasm in a backend thread, so as not to block the main
-       thread fast jit execution, since applying llvm optimizations in
-       aot_compile_wasm may cost a lot of time.
-       Create thread with enough native stack to apply llvm optimizations */
-    if (os_thread_create(&module->llvm_jit_init_thread,
-                         init_llvm_jit_functions_stage2_callback,
-                         (void *)module, APP_THREAD_STACK_SIZE_DEFAULT * 8)
-        != 0) {
-        set_error_buf(error_buf, error_buf_size,
-                      "create orcjit compile thread failed");
-        return false;
-    }
+        /* Run aot_compile_wasm in a backend thread, so as not to block the main
+           thread fast jit execution, since applying llvm optimizations in
+           aot_compile_wasm may cost a lot of time.
+           Create thread with enough native stack to apply llvm optimizations */
+        if (os_thread_create(&module->llvm_jit_init_thread,
+                             init_llvm_jit_functions_stage2_callback,
+                             (void *)module, APP_THREAD_STACK_SIZE_DEFAULT * 8)
+            != 0) {
+            set_error_buf(error_buf, error_buf_size,
+                          "create orcjit compile thread failed");
+            return false;
+        }
 #endif
 #endif
 
 #if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0
-    /* Create threads to compile the jit functions */
-    if (!compile_jit_functions(module, error_buf, error_buf_size)) {
-        return false;
+        /* Create threads to compile the jit functions */
+        if (!compile_jit_functions(module, error_buf, error_buf_size)) {
+            return false;
+        }
     }
+#else
+    (void)defer_jit;
 #endif
 
 #if WASM_ENABLE_MEMORY_TRACING != 0
     wasm_runtime_dump_module_mem_consumption((WASMModuleCommon *)module);
 #endif
+    if (!module->function_count)
+        module->native_code_policy = WASM_NATIVE_CODE_NONE;
     return true;
 }
 
@@ -6940,8 +7104,8 @@ wasm_loader_load_from_sections(WASMSection *section_list, char *error_buf,
     if (!module)
         return NULL;
 
-    if (!load_from_sections(module, section_list, false, true, false, error_buf,
-                            error_buf_size)) {
+    if (!load_from_sections(module, section_list, false, true, false, false,
+                            error_buf, error_buf_size)) {
         wasm_loader_unload(module);
         return NULL;
     }
@@ -7085,7 +7249,7 @@ static union {
 
 static bool
 load(const uint8 *buf, uint32 size, WASMModule *module,
-     bool wasm_binary_freeable, bool no_resolve, char *error_buf,
+     bool wasm_binary_freeable, bool no_resolve, bool defer_jit, char *error_buf,
      uint32 error_buf_size)
 {
     const uint8 *buf_end = buf + size;
@@ -7117,7 +7281,8 @@ load(const uint8 *buf, uint32 size, WASMModule *module,
 
     if (!create_sections(buf, size, &section_list, error_buf, error_buf_size)
         || !load_from_sections(module, section_list, true, wasm_binary_freeable,
-                               no_resolve, error_buf, error_buf_size)) {
+                               no_resolve, defer_jit, error_buf,
+                               error_buf_size)) {
         destroy_sections(section_list);
         return false;
     }
@@ -7282,10 +7447,22 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
                  const LoadArgs *args, char *error_buf, uint32 error_buf_size)
 {
-    WASMModule *module = create_module(args->name, error_buf, error_buf_size);
+    WASMModule *module;
+    bool defer_jit = false;
+#if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0
+    defer_jit = args->defer_jit;
+#endif
+    if (args->block_type_mode != WASM_BLOCK_TYPES_STANDARD
+        && args->block_type_mode != WASM_BLOCK_TYPES_NUMERIC
+        && args->block_type_mode != WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO) {
+        set_error_buf(error_buf, error_buf_size, "invalid block type mode");
+        return NULL;
+    }
+    module = create_module(args->name, error_buf, error_buf_size);
     if (!module) {
         return NULL;
     }
+    module->forge_block_type_mode = (uint8)args->block_type_mode;
 
 #if WASM_ENABLE_DEBUG_INTERP != 0 || WASM_ENABLE_FAST_JIT != 0 \
     || WASM_ENABLE_DUMP_CALL_STACK != 0 || WASM_ENABLE_JIT != 0
@@ -7294,7 +7471,7 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
 
     if (!load(buf, size, module, args->wasm_binary_freeable, args->no_resolve,
-              error_buf, error_buf_size)) {
+              defer_jit, error_buf, error_buf_size)) {
         goto fail;
     }
 
@@ -7339,12 +7516,7 @@ wasm_loader_unload(WASMModule *module)
 #endif
 
 #if WASM_ENABLE_JIT != 0
-    if (module->func_ptrs)
-        wasm_runtime_free(module->func_ptrs);
-    if (module->comp_ctx)
-        aot_destroy_comp_context(module->comp_ctx);
-    if (module->comp_data)
-        aot_destroy_comp_data(module->comp_data);
+    destroy_llvm_jit_functions(module);
 #endif
 
 #if WASM_ENABLE_FAST_JIT != 0 && WASM_ENABLE_JIT != 0 \
@@ -8487,6 +8659,7 @@ typedef struct BranchBlock {
      * pop any type of value directly without decreasing stack top pointer
      * and stack cell num. */
     bool is_stack_polymorphic;
+    bool forge_parent_unreachable;
 } BranchBlock;
 
 typedef struct WASMLoaderContext {
@@ -8497,6 +8670,9 @@ typedef struct WASMLoaderContext {
     uint32 frame_ref_size;
     uint32 stack_cell_num;
     uint32 max_stack_cell_num;
+    uint32 forge_operand_cells;
+    uint64 forge_legacy_depth;
+    uint64 forge_max_legacy_depth;
 
 #if WASM_ENABLE_GC != 0
     /* frame reftype map stack */
@@ -8965,6 +9141,13 @@ wasm_loader_push_frame_ref(WASMLoaderContext *ctx, uint8 type, char *error_buf,
         *ctx->frame_ref++ = type;
     ctx->stack_cell_num += type_cell_num;
 
+    if (ctx->csp_num > 0) {
+        const BranchBlock *block = ctx->frame_csp - 1;
+        if (!block->is_stack_polymorphic && !block->forge_parent_unreachable
+            && ctx->stack_cell_num > ctx->forge_operand_cells)
+            ctx->forge_operand_cells = ctx->stack_cell_num;
+    }
+
     if (ctx->stack_cell_num > ctx->max_stack_cell_num) {
         ctx->max_stack_cell_num = ctx->stack_cell_num;
         if (ctx->max_stack_cell_num > UINT16_MAX) {
@@ -9342,6 +9525,11 @@ wasm_loader_push_frame_csp(WASMLoaderContext *ctx, uint8 label_type,
 {
     CHECK_CSP_PUSH();
     memset(ctx->frame_csp, 0, sizeof(BranchBlock));
+    if (ctx->csp_num > 0) {
+        const BranchBlock *parent = ctx->frame_csp - 1;
+        ctx->frame_csp->forge_parent_unreachable =
+            parent->is_stack_polymorphic || parent->forge_parent_unreachable;
+    }
     ctx->frame_csp->label_type = label_type;
     ctx->frame_csp->block_type = block_type;
     ctx->frame_csp->start_addr = start_addr;
@@ -11972,10 +12160,26 @@ re_scan:
     }
 #endif
 
+    loader_ctx->forge_legacy_depth = module->forge_legacy_depth;
+    loader_ctx->forge_max_legacy_depth = module->forge_max_legacy_depth;
     PUSH_CSP(LABEL_TYPE_FUNCTION, func_block_type, p);
 
     while (p < p_end) {
         opcode = *p++;
+        /* Preserve the old optional counter, including else and function end.
+           Fast-interpreter rescans restart from the module's incoming state. */
+        if (opcode == WASM_OP_BLOCK || opcode == WASM_OP_LOOP
+            || opcode == WASM_OP_IF || opcode == WASM_OP_ELSE) {
+            loader_ctx->forge_legacy_depth++;
+            if (loader_ctx->forge_legacy_depth > loader_ctx->forge_max_legacy_depth)
+                loader_ctx->forge_max_legacy_depth = loader_ctx->forge_legacy_depth;
+        }
+        else if (opcode == WASM_OP_END) {
+            if (loader_ctx->forge_legacy_depth == 0)
+                loader_ctx->forge_legacy_depth = 1;
+            else
+                loader_ctx->forge_legacy_depth--;
+        }
 #if WASM_ENABLE_FAST_INTERP != 0
         p_org = p;
         disable_emit = false;
@@ -12047,6 +12251,23 @@ re_scan:
 
                 CHECK_BUF(p, p_end, 1);
                 value_type = read_uint8(p);
+                if (module->forge_block_type_mode != WASM_BLOCK_TYPES_STANDARD) {
+                    if (value_type == 0
+                        && module->forge_block_type_mode
+                               == WASM_BLOCK_TYPES_NUMERIC_LEGACY_ZERO) {
+                        value_type = VALUE_TYPE_VOID;
+                        *(p - 1) = VALUE_TYPE_VOID;
+                    }
+                    else if (value_type != VALUE_TYPE_VOID
+                             && value_type != VALUE_TYPE_I32
+                             && value_type != VALUE_TYPE_I64
+                             && value_type != VALUE_TYPE_F32
+                             && value_type != VALUE_TYPE_F64) {
+                        set_error_buf(error_buf, error_buf_size,
+                                      "unsupported numeric block type");
+                        goto fail;
+                    }
+                }
                 if (is_byte_a_type(value_type)) {
                     /* If the first byte is one of these special values:
                      * 0x40/0x7F/0x7E/0x7D/0x7C, take it as the type of
@@ -12780,6 +13001,8 @@ re_scan:
 #endif
 
                 pb_read_leb_uint32(p, p_end, count);
+                if (count > func->forge_br_table_elements)
+                    func->forge_br_table_elements = count;
 #if WASM_ENABLE_FAST_INTERP != 0
                 emit_uint32(loader_ctx, count);
 #endif
@@ -14392,6 +14615,8 @@ re_scan:
                 CHECK_MEMORY();
                 pb_read_leb_memarg(p, p_end, align);          /* align */
                 pb_read_leb_mem_offset(p, p_end, mem_offset); /* offset */
+                if (mem_offset > func->forge_memory_offset)
+                    func->forge_memory_offset = mem_offset;
                 if (!check_memory_access_align(opcode, align, error_buf,
                                                error_buf_size)) {
                     goto fail;
@@ -17090,6 +17315,9 @@ re_scan:
     func->max_stack_cell_num = loader_ctx->max_stack_cell_num;
 #endif
     func->max_block_num = loader_ctx->max_csp_num;
+    func->forge_operand_cells = loader_ctx->forge_operand_cells;
+    module->forge_legacy_depth = loader_ctx->forge_legacy_depth;
+    module->forge_max_legacy_depth = loader_ctx->forge_max_legacy_depth;
     return_value = true;
 
 fail:

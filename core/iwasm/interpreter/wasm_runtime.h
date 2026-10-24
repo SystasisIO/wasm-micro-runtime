@@ -191,6 +191,15 @@ struct WASMTableInstance {
     table_elem_type_t elems[1];
 };
 
+static inline uint64
+wasm_table_instance_size(uint32 elem_count, uint32 elem_size)
+{
+    /* elem_size is the target pointer width when used by the AOT compiler. */
+    return align_uint64(offsetof(WASMTableInstance, elems)
+                            + (uint64)elem_size * elem_count,
+                        8);
+}
+
 struct WASMGlobalInstance {
     /* value type, VALUE_TYPE_I32/I64/F32/F64 */
     uint8 type;
@@ -277,27 +286,32 @@ struct WASMTagInstance {
 #endif
 typedef struct WASMExportFuncInstance {
     char *name;
+    uint32 name_len;
     WASMFunctionInstance *function;
 } WASMExportFuncInstance;
 
 typedef struct WASMExportGlobInstance {
     char *name;
+    uint32 name_len;
     WASMGlobalInstance *global;
 } WASMExportGlobInstance;
 
 typedef struct WASMExportTabInstance {
     char *name;
+    uint32 name_len;
     WASMTableInstance *table;
 } WASMExportTabInstance;
 
 typedef struct WASMExportMemInstance {
     char *name;
+    uint32 name_len;
     WASMMemoryInstance *memory;
 } WASMExportMemInstance;
 
 #if WASM_ENABLE_TAGS != 0
 typedef struct WASMExportTagInstance {
     char *name;
+    uint32 name_len;
     WASMTagInstance *tag;
 } WASMExportTagInstance;
 #endif
@@ -314,6 +328,7 @@ typedef struct CApiFuncImport {
 
 /* The common part of WASMModuleInstanceExtra and AOTModuleInstanceExtra */
 typedef struct WASMModuleInstanceExtraCommon {
+    bool initialization_pending;
 #if WASM_ENABLE_MODULE_INST_CONTEXT != 0
     void *contexts[WASM_MAX_INSTANCE_CONTEXTS];
 #endif
@@ -337,7 +352,11 @@ typedef struct WASMModuleInstanceExtraCommon {
 #if WASM_ENABLE_THREAD_MGR != 0
     korp_mutex exception_lock;
 #endif
+    WASMExceptionInfo exception_info;
 } WASMModuleInstanceExtraCommon;
+
+bool
+wasm_initialize(WASMModuleInstance *module_inst, WASMExecEnv *exec_env);
 
 /* Extra info of WASM module instance for interpreter/jit mode */
 typedef struct WASMModuleInstanceExtra {
@@ -607,6 +626,17 @@ wasm_set_exception(WASMModuleInstance *module, const char *exception);
 
 void
 wasm_set_exception_with_id(WASMModuleInstance *module_inst, uint32 id);
+
+/* Preserve a call site's diagnostic while supplying its actual engine ID. */
+void
+wasm_set_exception_with_id_and_message(WASMModuleInstance *module_inst,
+                                      uint32 id, const char *exception);
+
+/* Internal forwarding only: exception is already formatted. Does not acquire
+   a cluster lock; writes the message and classification under one local lock. */
+void
+wasm_set_exception_local(WASMModuleInstance *module_inst,
+                         const char *exception, WASMExceptionInfo info);
 
 const char *
 wasm_get_exception(WASMModuleInstance *module);
@@ -893,13 +923,15 @@ exception_unlock(WASMModuleInstance *module_inst);
 #define exception_unlock(module_inst) (void)(module_inst)
 #endif
 
-bool
-wasm_check_utf8_str(const uint8 *str, uint32 len);
-
 char *
 wasm_const_str_list_insert(const uint8 *str, uint32 len, WASMModule *module,
                            bool is_load_from_file_buf, char *error_buf,
                            uint32 error_buf_size);
+
+char *
+wasm_export_name_insert(const uint8 *str, uint32 len, WASMModule *module,
+                        bool is_load_from_file_buf, char *error_buf,
+                        uint32 error_buf_size);
 
 bool
 wasm_set_module_name(WASMModule *module, const char *name, char *error_buf,

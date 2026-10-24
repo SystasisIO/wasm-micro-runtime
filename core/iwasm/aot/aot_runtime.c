@@ -827,10 +827,10 @@ tables_instantiate(AOTModuleInstance *module_inst, AOTModule *module,
 #endif
 
         module_inst->tables[i] = tbl_inst;
-        tbl_inst = (AOTTableInstance *)((uint8 *)tbl_inst
-                                        + offsetof(AOTTableInstance, elems)
-                                        + sizeof(table_elem_type_t)
-                                              * tbl_inst->max_size);
+        tbl_inst = (AOTTableInstance *)(
+            (uint8 *)tbl_inst
+            + (uint32)wasm_table_instance_size(tbl_inst->max_size,
+                                               sizeof(table_elem_type_t)));
     }
 
     /* fill table with element segment content */
@@ -1189,7 +1189,8 @@ aot_lookup_memory(AOTModuleInstance *module_inst, char const *name)
 #if WASM_ENABLE_MULTI_MEMORY != 0
     uint32 i;
     for (i = 0; i < module_inst->export_memory_count; i++)
-        if (!strcmp(module_inst->export_memories[i].name, name))
+        if (wasm_name_equals(module_inst->export_memories[i].name,
+                             module_inst->export_memories[i].name_len, name))
             return module_inst->export_memories[i].memory;
     return NULL;
 #else
@@ -1574,7 +1575,8 @@ cmp_func_inst(const void *a, const void *b)
     const AOTFunctionInstance *func_inst1 = (const AOTFunctionInstance *)a;
     const AOTFunctionInstance *func_inst2 = (const AOTFunctionInstance *)b;
 
-    return strcmp(func_inst1->func_name, func_inst2->func_name);
+    return wasm_name_compare(func_inst1->func_name, func_inst1->func_name_len,
+                             func_inst2->func_name, func_inst2->func_name_len);
 }
 
 static bool
@@ -1598,6 +1600,7 @@ create_export_funcs(AOTModuleInstance *module_inst, AOTModule *module,
         for (i = 0; i < module->export_count; i++) {
             if (exports[i].kind == EXPORT_KIND_FUNC) {
                 export_func->func_name = exports[i].name;
+                export_func->func_name_len = exports[i].name_len;
                 export_func->func_index = exports[i].index;
                 if (export_func->func_index < module->import_func_count) {
                     export_func->is_import_func = true;
@@ -1646,6 +1649,7 @@ export_memories_instantiate(const AOTModule *module,
     for (i = 0; i < module->export_count; i++, export ++)
         if (export->kind == EXPORT_KIND_MEMORY) {
             export_memory->name = export->name;
+            export_memory->name_len = export->name_len;
             export_memory->memory = module_inst->memories[export->index];
             export_memory++;
         }
@@ -1706,7 +1710,8 @@ lookup_post_instantiate_func(AOTModuleInstance *module_inst,
         /* Not found */
         return NULL;
 
-    func_type = func->u.func.func_type;
+    func_type = func->is_import_func ? func->u.func_import->func_type
+                                    : func->u.func.func_type;
     if (!(func_type->param_count == 0 && func_type->result_count == 0))
         /* Not a valid function type, ignore it */
         return NULL;
@@ -1761,8 +1766,8 @@ execute_post_instantiate_functions(AOTModuleInstance *module_inst,
     }
 #endif
 
-    if (!module->start_function && !initialize_func && !post_inst_func
-        && !call_ctors_func) {
+    if (module->start_func_index == (uint32)-1 && !initialize_func
+        && !post_inst_func && !call_ctors_func) {
         /* No post instantiation functions to call */
         return true;
     }
@@ -1789,8 +1794,10 @@ execute_post_instantiate_functions(AOTModuleInstance *module_inst,
     }
     else {
         /* Try using the existing exec_env */
+        exec_env = exec_env_main;
 #ifdef OS_ENABLE_HW_BOUND_CHECK
-        exec_env = exec_env_tls;
+        if (!exec_env)
+            exec_env = exec_env_tls;
 #endif
 #if WASM_ENABLE_THREAD_MGR != 0
         if (!exec_env)
@@ -1801,7 +1808,7 @@ execute_post_instantiate_functions(AOTModuleInstance *module_inst,
             if (!(exec_env = exec_env_created = wasm_exec_env_create(
                       (WASMModuleInstanceCommon *)module_inst,
                       module_inst->default_wasm_stack_size))) {
-                aot_set_exception(module_inst, "allocate memory failed");
+                wasm_set_exception_with_id_and_message((WASMModuleInstance *)module_inst, EXCE_OUT_OF_MEMORY, "allocate memory failed");
                 return false;
             }
         }
@@ -1825,18 +1832,24 @@ execute_post_instantiate_functions(AOTModuleInstance *module_inst,
 #endif
 
     /* Execute start function for both main instance and sub instance */
-    if (module->start_function) {
+    if (module->start_func_index != (uint32)-1) {
         AOTFunctionInstance start_func = { 0 };
-        uint32 func_type_idx;
 
         start_func.func_name = "";
         start_func.func_index = module->start_func_index;
-        start_func.is_import_func = false;
-        func_type_idx = module->func_type_indexes[module->start_func_index
-                                                  - module->import_func_count];
-        start_func.u.func.func_type =
-            (AOTFuncType *)module->types[func_type_idx];
-        start_func.u.func.func_ptr = module->start_function;
+        if (module->start_func_index < module->import_func_count) {
+            start_func.is_import_func = true;
+            start_func.u.func_import =
+                &module->import_funcs[module->start_func_index];
+        }
+        else {
+            uint32 func_type_idx =
+                module->func_type_indexes[module->start_func_index
+                                          - module->import_func_count];
+            start_func.u.func.func_type =
+                (AOTFuncType *)module->types[func_type_idx];
+            start_func.u.func.func_ptr = module->start_function;
+        }
         if (!aot_call_function(exec_env, &start_func, 0, NULL)) {
             goto fail;
         }
@@ -1875,6 +1888,17 @@ fail:
     return ret;
 }
 
+bool
+aot_initialize(AOTModuleInstance *module_inst, WASMExecEnv *exec_env)
+{
+    if (!module_inst->e->common.initialization_pending) {
+        aot_set_exception(module_inst, "initialization is not pending");
+        return false;
+    }
+    module_inst->e->common.initialization_pending = false;
+    return execute_post_instantiate_functions(module_inst, false, exec_env);
+}
+
 static bool
 check_linked_symbol(AOTModule *module, char *error_buf, uint32 error_buf_size)
 {
@@ -1910,7 +1934,7 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
         offsetof(AOTModuleInstance, global_table_data.bytes);
     const uint64 module_inst_mem_inst_size =
         (uint64)module->memory_count * sizeof(AOTMemoryInstance);
-    uint64 total_size, table_size = 0;
+    uint64 total_size, table_data_offset, table_size = 0;
     uint8 *p;
     uint32 i, extra_info_offset;
     const bool is_sub_inst = parent != NULL;
@@ -1926,29 +1950,40 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
     if (heap_size > APP_HEAP_SIZE_MAX)
         heap_size = APP_HEAP_SIZE_MAX;
 
-    total_size = (uint64)module_inst_struct_size + module_inst_mem_inst_size
-                 + module->global_data_size;
+    table_data_offset = align_uint64((uint64)module_inst_struct_size
+                                        + module_inst_mem_inst_size
+                                        + module->global_data_size,
+                                    8);
 
     /*
      * calculate size of table data
      */
     for (i = 0; i != module->import_table_count; ++i) {
-        table_size += offsetof(AOTTableInstance, elems);
-        table_size += (uint64)sizeof(table_elem_type_t)
-                      * (uint64)aot_get_imp_tbl_data_slots(
-                          module->import_tables + i, false);
+        table_size += wasm_table_instance_size(
+            aot_get_imp_tbl_data_slots(module->import_tables + i, false),
+            sizeof(table_elem_type_t));
+        if (table_size >= UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+            return NULL;
+        }
     }
 
     for (i = 0; i != module->table_count; ++i) {
-        table_size += offsetof(AOTTableInstance, elems);
-        table_size +=
-            (uint64)sizeof(table_elem_type_t)
-            * (uint64)aot_get_tbl_data_slots(module->tables + i, false);
+        table_size += wasm_table_instance_size(
+            aot_get_tbl_data_slots(module->tables + i, false),
+            sizeof(table_elem_type_t));
+        if (table_size >= UINT32_MAX) {
+            set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+            return NULL;
+        }
     }
-    total_size += table_size;
+    total_size = table_data_offset + table_size;
 
-    /* The offset of AOTModuleInstanceExtra, make it 8-byte aligned */
-    total_size = (total_size + 7LL) & ~7LL;
+    /* The table start and every table stride are already 8-byte aligned. */
+    if (total_size >= UINT32_MAX - sizeof(AOTModuleInstanceExtra)) {
+        set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+        return NULL;
+    }
     extra_info_offset = (uint32)total_size;
     total_size += sizeof(AOTModuleInstanceExtra);
 
@@ -2066,7 +2101,7 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
         goto fail;
 
     /* Initialize table info */
-    p += module->global_data_size;
+    p = (uint8 *)module_inst + (uint32)table_data_offset;
     module_inst->table_count = module->table_count + module->import_table_count;
     if (!tables_instantiate(module_inst, module, (AOTTableInstance *)p,
                             error_buf, error_buf_size))
@@ -2306,7 +2341,10 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
     }
 #endif
 
-    if (!execute_post_instantiate_functions(module_inst, is_sub_inst,
+    if (args->defer_start && !is_sub_inst) {
+        module_inst->e->common.initialization_pending = true;
+    }
+    else if (!execute_post_instantiate_functions(module_inst, is_sub_inst,
                                             exec_env_main)) {
         set_error_buf(error_buf, error_buf_size, module_inst->cur_exception);
         goto fail;
@@ -2447,9 +2485,13 @@ aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst)
 AOTFunctionInstance *
 aot_lookup_function(const AOTModuleInstance *module_inst, const char *name)
 {
+    size_t name_len = strlen(name);
+    if (name_len > UINT32_MAX)
+        return NULL;
     AOTFunctionInstance *export_funcs =
         (AOTFunctionInstance *)module_inst->export_functions;
-    AOTFunctionInstance key = { .func_name = (char *)name };
+    AOTFunctionInstance key = { .func_name = (char *)name,
+                               .func_name_len = (uint32)name_len };
 
     if (!export_funcs)
         return NULL;
@@ -2675,6 +2717,11 @@ aot_call_function(WASMExecEnv *exec_env, AOTFunctionInstance *function,
     /* Set exec env, so it can be later retrieved from instance */
     module_inst->cur_exec_env = exec_env;
 
+    /* An exported import keeps its native calling convention. The generic
+       compiled-code trampoline does not accept raw (exec_env, uint64*) callbacks. */
+    if (function->is_import_func && function->u.func_import->call_conv_raw)
+        return aot_invoke_native(exec_env, function->func_index, argc, argv);
+
     if (ext_ret_count > 0) {
         uint32 cell_num = 0, i;
         uint8 *ext_ret_types = func_type->types + func_type->param_count + 1;
@@ -2693,8 +2740,7 @@ aot_call_function(WASMExecEnv *exec_env, AOTFunctionInstance *function,
                   * (uint64)ext_ret_count /* extra result values' addr */
             + sizeof(uint32) * (uint64)ext_ret_cell; /* extra result values */
         if (size > sizeof(argv1_buf)
-            && !(argv1 = runtime_malloc(size, module_inst->cur_exception,
-                                        sizeof(module_inst->cur_exception)))) {
+            && !(argv1 = runtime_malloc(size, NULL, 0))) {
             aot_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
             return false;
         }
@@ -2920,7 +2966,7 @@ execute_malloc_function(AOTModuleInstance *module_inst, WASMExecEnv *exec_env,
             if (!(exec_env = exec_env_created = wasm_exec_env_create(
                       (WASMModuleInstanceCommon *)module_inst,
                       module_inst->default_wasm_stack_size))) {
-                wasm_set_exception(module_inst, "allocate memory failed");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
                 return false;
             }
         }
@@ -3010,7 +3056,7 @@ execute_free_function(AOTModuleInstance *module_inst, WASMExecEnv *exec_env,
             if (!(exec_env = exec_env_created = wasm_exec_env_create(
                       (WASMModuleInstanceCommon *)module_inst,
                       module_inst->default_wasm_stack_size))) {
-                wasm_set_exception(module_inst, "allocate memory failed");
+                wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
                 return false;
             }
         }
@@ -3132,7 +3178,7 @@ aot_module_realloc_internal(AOTModuleInstance *module_inst,
             aot_set_exception(module_inst, "app heap corrupted");
         }
         else {
-            aot_set_exception(module_inst, "out of memory");
+            wasm_set_exception_with_id_and_message((WASMModuleInstance *)module_inst, EXCE_OUT_OF_MEMORY, "out of memory");
         }
         return 0;
     }
@@ -3440,8 +3486,7 @@ aot_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 table_elem_idx,
                   * (uint64)ext_ret_count /* extra result values' addr */
             + sizeof(uint32) * (uint64)ext_ret_cell; /* extra result values */
         if (size > sizeof(argv1_buf)
-            && !(argv1 = runtime_malloc(size, module_inst->cur_exception,
-                                        sizeof(module_inst->cur_exception)))) {
+            && !(argv1 = runtime_malloc(size, NULL, 0))) {
             aot_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
             goto fail;
         }
@@ -3621,7 +3666,7 @@ aot_memory_init(AOTModuleInstance *module_inst, uint32 seg_index, uint32 offset,
         return false;
 
     if ((uint64)offset + (uint64)len > seg_len) {
-        aot_set_exception(module_inst, "out of bounds memory access");
+        wasm_set_exception_with_id_and_message((WASMModuleInstance *)module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, "out of bounds memory access");
         return false;
     }
 
@@ -3657,7 +3702,8 @@ aot_set_aux_stack(WASMExecEnv *exec_env, uint64 start_offset, uint32 size)
     uint32 stack_top_idx = module->aux_stack_top_global_index;
     uint64 data_end = module->aux_data_end;
     uint64 stack_bottom = module->aux_stack_bottom;
-    bool is_stack_before_data = stack_bottom < data_end ? true : false;
+    /* Match the loader's stack-first layout when stack and data abut. */
+    bool is_stack_before_data = stack_bottom <= data_end;
 
     /* Check the aux stack space, currently we don't allocate space in heap */
     if ((is_stack_before_data && (size > start_offset))
@@ -3747,6 +3793,8 @@ aot_get_module_mem_consumption(const AOTModule *module,
     mem_conspn->memories_size = sizeof(AOTMemory) * module->memory_count;
     mem_conspn->globals_size = sizeof(AOTGlobal) * module->global_count;
     mem_conspn->exports_size = sizeof(AOTExport) * module->export_count;
+    for (i = 0; i < module->export_count; i++)
+        mem_conspn->exports_size += module->exports[i].name_len + 1;
 
     mem_conspn->table_segs_size =
         sizeof(AOTTableInitData *) * module->table_init_data_count;
@@ -4116,7 +4164,7 @@ aot_alloc_standard_frame(WASMExecEnv *exec_env, uint32 func_index)
         frame = (AOTFrame *)((uint8 *)cur_frame + size);
 
     if ((uint8 *)frame + size > exec_env->wasm_stack.top_boundary) {
-        aot_set_exception(module_inst, "wasm operand stack overflow");
+        wasm_set_exception_with_id_and_message((WASMModuleInstance *)module_inst, EXCE_OPERAND_STACK_OVERFLOW, "wasm operand stack overflow");
         return false;
     }
 
@@ -4181,7 +4229,7 @@ aot_alloc_standard_frame(WASMExecEnv *exec_env, uint32 func_index)
     frame = wasm_exec_env_alloc_wasm_frame(exec_env, frame_size);
 
     if (!frame) {
-        aot_set_exception(module_inst, "wasm operand stack overflow");
+        wasm_set_exception_with_id_and_message((WASMModuleInstance *)module_inst, EXCE_OPERAND_STACK_OVERFLOW, "wasm operand stack overflow");
         return false;
     }
 
@@ -4210,8 +4258,7 @@ aot_alloc_tiny_frame(WASMExecEnv *exec_env, uint32 func_index)
 
     if ((uint8 *)new_frame + sizeof(AOTTinyFrame)
         > exec_env->wasm_stack.top_boundary) {
-        aot_set_exception((WASMModuleInstance *)exec_env->module_inst,
-                          "wasm operand stack overflow");
+        wasm_set_exception_with_id_and_message((WASMModuleInstance *)(WASMModuleInstance *)exec_env->module_inst, EXCE_OPERAND_STACK_OVERFLOW, "wasm operand stack overflow");
         return false;
     }
 
@@ -5251,16 +5298,17 @@ aot_create_func_obj(AOTModuleInstance *module_inst, uint32 func_idx,
     WASMFuncObjectRef func_obj;
     AOTFuncType *func_type;
     uint32 type_idx;
+    char local_error[EXCEPTION_BUF_LEN];
 
     if (throw_exce) {
-        error_buf = module_inst->cur_exception;
-        error_buf_size = sizeof(module_inst->cur_exception);
+        error_buf = local_error;
+        error_buf_size = sizeof(local_error);
     }
 
     if (func_idx >= module->import_func_count + module->func_count) {
         set_error_buf_v(error_buf, error_buf_size, "unknown function %d",
                         func_idx);
-        return NULL;
+        goto fail;
     }
 
     type_idx = module_inst->func_type_indexes[func_idx];
@@ -5270,17 +5318,25 @@ aot_create_func_obj(AOTModuleInstance *module_inst, uint32 func_idx,
                                        module->rtt_types, module->type_count,
                                        &module->rtt_type_lock))) {
         set_error_buf(error_buf, error_buf_size, "create rtt object failed");
-        return NULL;
+        goto fail;
     }
 
     if (!(func_obj = wasm_func_obj_new_internal(
               ((AOTModuleInstanceExtra *)module_inst->e)->common.gc_heap_handle,
               rtt_type, func_idx))) {
         set_error_buf(error_buf, error_buf_size, "create func object failed");
-        return NULL;
+        goto fail;
     }
 
     return func_obj;
+
+fail:
+    if (throw_exce) {
+        WASMExceptionInfo info = { WASM_EXCEPTION_UNKNOWN, 0 };
+        wasm_set_exception_local((WASMModuleInstance *)module_inst, local_error,
+                                  info);
+    }
+    return NULL;
 }
 
 bool
@@ -5339,7 +5395,7 @@ aot_array_init_with_data(AOTModuleInstance *module_inst, uint32 seg_index,
     data = aot_module->mem_init_data_list[seg_index]->bytes;
 
     if (data_seg_offset >= seg_len || total_size > seg_len - data_seg_offset) {
-        aot_set_exception(module_inst, "out of bounds memory access");
+        wasm_set_exception_with_id_and_message((WASMModuleInstance *)module_inst, EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, "out of bounds memory access");
         return false;
     }
 

@@ -96,6 +96,11 @@ typedef struct AOTCompOption {
     const char *stack_usage_file;
     const char *llvm_passes;
     const char *builtin_intrinsics;
+    /* Explicit, bounded synchronous LLVM JIT; ordinary upstream JIT defaults
+       remain unchanged when this trailing option is zero initialized. */
+    bool jit_compile_on_caller_thread;
+    const struct WASMLoadBudget *jit_load_budget;
+    uint64_t jit_native_map_limit;
 } AOTCompOption, *aot_comp_option_t;
 
 #ifdef __cplusplus
